@@ -1,0 +1,47 @@
+
+======================================================================
+   🚀 QUEEN KOBA SKINCARE API - MONGODB EDITION
+======================================================================
+✅ Connected to MongoDB
+
+📦 Features:
+   • User registration & authentication
+   • Shopping cart with add/remove functionality
+   • Checkout and order management
+   • Multi-currency pricing (KES, UGX, BIF, CDF)
+   • Country-specific payment methods
+
+💱 Supported Currencies:
+   KES - Kenyan Shilling
+   UGX - Ugandan Shilling
+   BIF - Burundi Franc
+   CDF - Congolese Franc
+
+💰 Payment Methods:
+   Kenya: M-Pesa, Airtel Money, Cards, Bank Transfer
+   Uganda: MTN Mobile Money, Airtel Money, Cards
+   Burundi: Lumicash, EcoCash, Cards
+   DRC Congo: Orange Money, Vodacom M-Pesa, Cards
+
+🌐 Server URLs:
+   Local:    http://localhost:5000
+   Network:  http://0.0.0.0:5000
+
+🔑 Default Admin:
+   Email: info@queenkoba.com
+   Password:N/A 
+
+======================================================================
+   Starting API... (Press Ctrl+C to stop)
+======================================================================
+
+ * Serving Flask app 'queenkoba_mongodb'
+ * Debug mode: on
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.0.36:5000
+[33mPress CTRL+C to quit[0m
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 882-353-904

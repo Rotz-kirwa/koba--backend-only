@@ -234,6 +234,84 @@ def get_product(product_id):
         return jsonify({'error': 'Invalid product ID'}), 400
 
 # ========== AUTH ROUTES ==========
+@app.route('/auth/signup', methods=['POST'])
+def signup():
+    try:
+        data = request.get_json()
+        
+        # Validation
+        if not data.get('email') or not data.get('password') or not data.get('name') or not data.get('phone'):
+            return jsonify({'message': 'Name, email, phone and password required'}), 400
+        
+        # Check if user exists
+        if mongo.db.users.find_one({'email': data['email']}):
+            return jsonify({'message': 'Email already registered'}), 400
+        
+        # Create user
+        user = {
+            'name': data['name'],
+            'email': data['email'],
+            'phone': data['phone'],
+            'password_hash': bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+            'role': 'customer',
+            'created_at': datetime.utcnow()
+        }
+        
+        result = mongo.db.users.insert_one(user)
+        user_id = str(result.inserted_id)
+        
+        # Create JWT token
+        token = create_access_token(identity=user_id)
+        
+        return jsonify({
+            'token': token,
+            'user': {
+                'id': user_id,
+                'name': user['name'],
+                'email': user['email'],
+                'phone': user['phone']
+            }
+        }), 201
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/auth/login', methods=['POST'])
+def customer_login():
+    try:
+        data = request.get_json()
+        
+        if not data.get('email') or not data.get('password'):
+            return jsonify({'message': 'Email and password required'}), 400
+        
+        # Find user
+        user = mongo.db.users.find_one({'email': data['email'], 'role': 'customer'})
+        if not user:
+            return jsonify({'message': 'Invalid credentials'}), 401
+        
+        # Check password
+        if not bcrypt.checkpw(data['password'].encode('utf-8'), user['password_hash'].encode('utf-8')):
+            return jsonify({'message': 'Invalid credentials'}), 401
+        
+        # Create token
+        token = create_access_token(identity=str(user['_id']))
+        
+        return jsonify({
+            'token': token,
+            'user': {
+                'id': str(user['_id']),
+                'name': user.get('name', user.get('username', '')),
+                'email': user['email'],
+                'phone': user.get('phone', '')
+            }
+        })
+    except Exception as e:
+        return jsonify({'message': str(e)}), 500
+
+@app.route('/auth/google', methods=['GET'])
+def google_login():
+    # Placeholder for Google OAuth - requires Google OAuth setup
+    return jsonify({'message': 'Google OAuth not configured yet'}), 501
+
 @app.route('/auth/register', methods=['POST'])
 def register():
     try:
@@ -647,8 +725,12 @@ def admin_login():
         
         # Find admin user
         user = mongo.db.users.find_one({'email': data['email']})
-        if not user or user.get('role') != 'admin':
+        if not user or user.get('role') not in ['admin', 'super_admin']:
             return jsonify({'error': 'Invalid credentials'}), 401
+        
+        # Check if suspended
+        if user.get('status') == 'suspended':
+            return jsonify({'error': 'Account suspended'}), 403
         
         # Check password
         if not bcrypt.checkpw(data['password'].encode('utf-8'), user['password_hash'].encode('utf-8')):
@@ -663,8 +745,8 @@ def admin_login():
                 '_id': str(user['_id']),
                 'email': user['email'],
                 'full_name': user.get('username', 'Admin'),
-                'role': 'super_admin',
-                'permissions': ['*']
+                'role': user.get('role', 'admin'),
+                'permissions': user.get('permissions', ['*'])
             }
         })
     except Exception as e:
@@ -723,6 +805,94 @@ def admin_get_products():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/admin/products', methods=['POST'])
+@jwt_required()
+def admin_create_product():
+    try:
+        data = request.get_json()
+        
+        new_product = {
+            'name': data.get('name'),
+            'description': data.get('description', ''),
+            'category': data.get('category', 'Other'),
+            'base_price_usd': data.get('base_price_usd', 0),
+            'prices': data.get('prices', {}),
+            'in_stock': data.get('in_stock', True),
+            'image_url': data.get('image_url', '/images/product.jpg'),
+            'created_at': datetime.utcnow(),
+            'updated_at': datetime.utcnow()
+        }
+        
+        result = mongo.db.products.insert_one(new_product)
+        new_product['_id'] = str(result.inserted_id)
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Product created successfully',
+            'product': serialize_doc(new_product)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/products/<product_id>', methods=['PUT'])
+@jwt_required()
+def admin_update_product(product_id):
+    try:
+        data = request.get_json()
+        
+        update_data = {
+            'updated_at': datetime.utcnow()
+        }
+        
+        if 'name' in data:
+            update_data['name'] = data['name']
+        if 'description' in data:
+            update_data['description'] = data['description']
+        if 'category' in data:
+            update_data['category'] = data['category']
+        if 'in_stock' in data:
+            update_data['in_stock'] = data['in_stock']
+        if 'prices' in data:
+            update_data['prices'] = data['prices']
+            # Also update base_price_usd if KES price is provided
+            if isinstance(data['prices'], dict) and 'KES' in data['prices']:
+                kes_amount = data['prices']['KES'].get('amount', 0)
+                update_data['base_price_usd'] = round(kes_amount / 128.5, 2)
+        
+        result = mongo.db.products.update_one(
+            {'_id': ObjectId(product_id)},
+            {'$set': update_data}
+        )
+        
+        if result.matched_count == 0:
+            return jsonify({'error': 'Product not found'}), 404
+        
+        updated_product = mongo.db.products.find_one({'_id': ObjectId(product_id)})
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Product updated successfully',
+            'product': serialize_doc(updated_product)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/products/<product_id>', methods=['DELETE'])
+@jwt_required()
+def admin_delete_product(product_id):
+    try:
+        result = mongo.db.products.delete_one({'_id': ObjectId(product_id)})
+        
+        if result.deleted_count == 0:
+            return jsonify({'error': 'Product not found'}), 404
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'Product deleted successfully'
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/admin/orders', methods=['GET'])
 @jwt_required()
 def admin_get_orders():
@@ -735,6 +905,26 @@ def admin_get_orders():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/admin/orders/<order_id>/status', methods=['PUT'])
+@jwt_required()
+def admin_update_order_status(order_id):
+    try:
+        data = request.get_json()
+        status = data.get('status')
+        note = data.get('note', '')
+        
+        mongo.db.orders.update_one(
+            {'_id': ObjectId(order_id)},
+            {'$set': {
+                'order_status': status,
+                'updated_at': datetime.utcnow(),
+                'status_note': note
+            }}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/admin/customers', methods=['GET'])
 @jwt_required()
 def admin_get_customers():
@@ -744,6 +934,475 @@ def admin_get_customers():
             'customers': [serialize_doc(c) for c in customers],
             'total': len(customers)
         })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== PROMOTIONS ==========
+@app.route('/promotions/active', methods=['GET'])
+def get_active_promotions():
+    try:
+        promotions = list(mongo.db.promotions.find({'status': 'active'}))
+        return jsonify({
+            'promotions': [serialize_doc(p) for p in promotions]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/promotions', methods=['GET'])
+@jwt_required()
+def admin_get_promotions():
+    try:
+        promotions = list(mongo.db.promotions.find())
+        return jsonify({
+            'promotions': [serialize_doc(p) for p in promotions]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/promotions', methods=['POST'])
+@jwt_required()
+def admin_create_promotion():
+    try:
+        data = request.get_json()
+        promo = {
+            'code': data.get('code', '').upper(),
+            'discount': data.get('discount', 0),
+            'type': data.get('type', 'percentage'),
+            'status': 'active',
+            'uses': 0,
+            'limit': data.get('limit'),
+            'expires': data.get('expires'),
+            'created_at': datetime.utcnow()
+        }
+        result = mongo.db.promotions.insert_one(promo)
+        promo['_id'] = str(result.inserted_id)
+        return jsonify({
+            'status': 'success',
+            'promotion': serialize_doc(promo)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/promotions/<promo_id>', methods=['DELETE'])
+@jwt_required()
+def admin_delete_promotion(promo_id):
+    try:
+        mongo.db.promotions.delete_one({'_id': ObjectId(promo_id)})
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/promotions/<promo_id>/status', methods=['PUT'])
+@jwt_required()
+def admin_update_promotion_status(promo_id):
+    try:
+        data = request.get_json()
+        mongo.db.promotions.update_one(
+            {'_id': ObjectId(promo_id)},
+            {'$set': {'status': data.get('status')}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== REVIEWS ==========
+@app.route('/admin/reviews', methods=['GET'])
+@jwt_required()
+def admin_get_reviews():
+    try:
+        reviews = list(mongo.db.reviews.find().sort('created_at', -1))
+        return jsonify({
+            'reviews': [serialize_doc(r) for r in reviews]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/reviews/<review_id>/approve', methods=['PUT'])
+@jwt_required()
+def admin_approve_review(review_id):
+    try:
+        mongo.db.reviews.update_one(
+            {'_id': ObjectId(review_id)},
+            {'$set': {'status': 'approved'}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/reviews/<review_id>/reject', methods=['PUT'])
+@jwt_required()
+def admin_reject_review(review_id):
+    try:
+        mongo.db.reviews.update_one(
+            {'_id': ObjectId(review_id)},
+            {'$set': {'status': 'rejected'}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/reviews/<review_id>', methods=['DELETE'])
+@jwt_required()
+def admin_delete_review(review_id):
+    try:
+        mongo.db.reviews.delete_one({'_id': ObjectId(review_id)})
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/reviews/approved', methods=['GET'])
+def get_approved_reviews():
+    try:
+        reviews = list(mongo.db.reviews.find({'status': 'approved'}).sort('created_at', -1).limit(50))
+        return jsonify({
+            'reviews': [serialize_doc(r) for r in reviews]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/products/<product_id>/reviews', methods=['POST'])
+def create_review(product_id):
+    try:
+        data = request.get_json()
+        review = {
+            'product_id': product_id,
+            'product_name': data.get('product_name'),
+            'customer_name': data.get('customer_name'),
+            'customer_email': data.get('customer_email'),
+            'rating': data.get('rating', 5),
+            'comment': data.get('comment'),
+            'status': 'pending',
+            'created_at': datetime.utcnow()
+        }
+        result = mongo.db.reviews.insert_one(review)
+        return jsonify({
+            'status': 'success',
+            'message': 'Review submitted for moderation',
+            'review_id': str(result.inserted_id)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== PAYMENTS ==========
+@app.route('/admin/payments', methods=['GET'])
+@jwt_required()
+def admin_get_payments():
+    try:
+        # Get payments from orders
+        orders = list(mongo.db.orders.find().sort('created_at', -1))
+        payments = []
+        
+        for order in orders:
+            payment = {
+                '_id': str(order['_id']),
+                'order_id': order.get('order_id'),
+                'customer_email': order.get('customer_email', 'N/A'),
+                'customer_name': order.get('shipping_address', {}).get('name', 'N/A'),
+                'amount': order.get('total_usd', 0),
+                'payment_method': order.get('payment_method', 'card'),
+                'payment_status': order.get('payment_status', 'pending'),
+                'created_at': order.get('created_at')
+            }
+            payments.append(payment)
+        
+        return jsonify({
+            'payments': payments
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== SHIPPING ZONES ==========
+@app.route('/admin/shipping-zones', methods=['GET'])
+@jwt_required()
+def admin_get_shipping_zones():
+    try:
+        zones = list(mongo.db.shipping_zones.find())
+        return jsonify({
+            'zones': [serialize_doc(z) for z in zones]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/shipping-zones', methods=['POST'])
+@jwt_required()
+def admin_create_shipping_zone():
+    try:
+        data = request.get_json()
+        zone = {
+            'name': data.get('name'),
+            'rate': data.get('rate'),
+            'currency': data.get('currency', 'KES'),
+            'delivery_days': data.get('delivery_days'),
+            'active': True,
+            'created_at': datetime.utcnow()
+        }
+        result = mongo.db.shipping_zones.insert_one(zone)
+        zone['_id'] = str(result.inserted_id)
+        return jsonify({
+            'status': 'success',
+            'zone': serialize_doc(zone)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/shipping-zones/<zone_id>', methods=['PUT'])
+@jwt_required()
+def admin_update_shipping_zone(zone_id):
+    try:
+        data = request.get_json()
+        mongo.db.shipping_zones.update_one(
+            {'_id': ObjectId(zone_id)},
+            {'$set': {
+                'name': data.get('name'),
+                'rate': data.get('rate'),
+                'delivery_days': data.get('delivery_days')
+            }}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/shipping-zones/<zone_id>/status', methods=['PUT'])
+@jwt_required()
+def admin_toggle_shipping_zone(zone_id):
+    try:
+        data = request.get_json()
+        mongo.db.shipping_zones.update_one(
+            {'_id': ObjectId(zone_id)},
+            {'$set': {'active': data.get('active')}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/shipping-zones/<zone_id>', methods=['DELETE'])
+@jwt_required()
+def admin_delete_shipping_zone(zone_id):
+    try:
+        mongo.db.shipping_zones.delete_one({'_id': ObjectId(zone_id)})
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/shipping-zones/active', methods=['GET'])
+def get_active_shipping_zones():
+    try:
+        zones = list(mongo.db.shipping_zones.find({'active': True}))
+        return jsonify({
+            'zones': [serialize_doc(z) for z in zones]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== CONTENT MANAGEMENT ==========
+@app.route('/admin/content', methods=['GET'])
+@jwt_required()
+def admin_get_content():
+    try:
+        content = mongo.db.site_content.find_one({'_id': 'main'})
+        if not content:
+            # Create default content
+            content = {
+                '_id': 'main',
+                'hero_title': 'Queen Koba Skincare',
+                'hero_subtitle': 'Luxurious skincare for melanin-rich skin',
+                'about_title': 'Our Story',
+                'about_description': 'Queen Koba is dedicated to creating premium skincare products for melanin-rich skin.',
+                'contact_email': 'info@queenkoba.com',
+                'contact_phone': '0119 559 180',
+                'contact_whatsapp': '0119 559 180',
+                'instagram_handle': '@queenkoba',
+                'footer_text': '© 2024 Queen Koba. All rights reserved.',
+            }
+            mongo.db.site_content.insert_one(content)
+        return jsonify({'content': serialize_doc(content)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/content', methods=['PUT'])
+@jwt_required()
+def admin_update_content():
+    try:
+        data = request.get_json()
+        section = data.get('section')
+        value = data.get('value')
+        
+        mongo.db.site_content.update_one(
+            {'_id': 'main'},
+            {'$set': {section: value}},
+            upsert=True
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/content', methods=['GET'])
+def get_public_content():
+    try:
+        content = mongo.db.site_content.find_one({'_id': 'main'})
+        return jsonify({'content': serialize_doc(content) if content else {}})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== ADMIN MANAGEMENT ==========
+@app.route('/admin/admins', methods=['GET'])
+@jwt_required()
+def get_all_admins():
+    try:
+        admins = list(mongo.db.users.find({'role': {'$in': ['admin', 'super_admin']}}))
+        return jsonify({
+            'admins': [serialize_doc(a) for a in admins]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/admins', methods=['POST'])
+@jwt_required()
+def create_admin():
+    try:
+        data = request.get_json()
+        
+        # Check if email exists
+        if mongo.db.users.find_one({'email': data['email']}):
+            return jsonify({'error': 'Email already exists'}), 400
+        
+        admin = {
+            'username': data.get('full_name'),
+            'email': data['email'],
+            'password_hash': bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+            'role': data.get('role', 'admin'),
+            'permissions': data.get('permissions', ['read', 'write']),
+            'status': 'active',
+            'created_at': datetime.utcnow()
+        }
+        result = mongo.db.users.insert_one(admin)
+        admin['_id'] = str(result.inserted_id)
+        return jsonify({
+            'status': 'success',
+            'admin': serialize_doc(admin)
+        }), 201
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/admins/<admin_id>', methods=['PUT'])
+@jwt_required()
+def update_admin(admin_id):
+    try:
+        data = request.get_json()
+        update_data = {}
+        
+        if 'full_name' in data:
+            update_data['username'] = data['full_name']
+        if 'email' in data:
+            update_data['email'] = data['email']
+        if 'role' in data:
+            update_data['role'] = data['role']
+        if 'permissions' in data:
+            update_data['permissions'] = data['permissions']
+        if 'password' in data and data['password']:
+            update_data['password_hash'] = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        
+        mongo.db.users.update_one(
+            {'_id': ObjectId(admin_id)},
+            {'$set': update_data}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/admins/<admin_id>/status', methods=['PUT'])
+@jwt_required()
+def update_admin_status(admin_id):
+    try:
+        data = request.get_json()
+        mongo.db.users.update_one(
+            {'_id': ObjectId(admin_id)},
+            {'$set': {'status': data.get('status')}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/admins/<admin_id>', methods=['DELETE'])
+@jwt_required()
+def delete_admin(admin_id):
+    try:
+        mongo.db.users.delete_one({'_id': ObjectId(admin_id)})
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+# ========== SUPPORT TICKETS ==========
+@app.route('/admin/support-tickets', methods=['GET'])
+@jwt_required()
+def admin_get_support_tickets():
+    try:
+        tickets = list(mongo.db.support_tickets.find().sort('created_at', -1))
+        return jsonify({
+            'tickets': [serialize_doc(t) for t in tickets]
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/support-tickets/<ticket_id>', methods=['GET'])
+@jwt_required()
+def admin_get_support_ticket(ticket_id):
+    try:
+        ticket = mongo.db.support_tickets.find_one({'_id': ObjectId(ticket_id)})
+        return jsonify({'ticket': serialize_doc(ticket)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/support-tickets/<ticket_id>/status', methods=['PUT'])
+@jwt_required()
+def admin_update_ticket_status(ticket_id):
+    try:
+        data = request.get_json()
+        mongo.db.support_tickets.update_one(
+            {'_id': ObjectId(ticket_id)},
+            {'$set': {'status': data.get('status')}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/support-tickets/<ticket_id>/reply', methods=['POST'])
+@jwt_required()
+def admin_reply_to_ticket(ticket_id):
+    try:
+        data = request.get_json()
+        reply = {
+            'message': data.get('message'),
+            'created_at': datetime.utcnow(),
+            'admin': True
+        }
+        mongo.db.support_tickets.update_one(
+            {'_id': ObjectId(ticket_id)},
+            {'$push': {'replies': reply}}
+        )
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/support-tickets', methods=['POST'])
+def create_support_ticket():
+    try:
+        data = request.get_json()
+        ticket = {
+            'customer_name': data.get('customer_name'),
+            'customer_email': data.get('customer_email'),
+            'subject': data.get('subject'),
+            'message': data.get('message'),
+            'priority': data.get('priority', 'medium'),
+            'status': 'open',
+            'replies': [],
+            'created_at': datetime.utcnow()
+        }
+        result = mongo.db.support_tickets.insert_one(ticket)
+        return jsonify({
+            'status': 'success',
+            'ticket_id': str(result.inserted_id)
+        }), 201
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
