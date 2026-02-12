@@ -33,6 +33,15 @@ app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 db = SQLAlchemy(app)
 jwt = JWTManager(app)
 
+# Initialize database on startup
+@app.before_request
+def initialize_database():
+    if not hasattr(app, 'db_initialized'):
+        with app.app_context():
+            db.create_all()
+            seed_data()
+            app.db_initialized = True
+
 # ========== MODELS ==========
 class User(db.Model):
     __tablename__ = 'users'
