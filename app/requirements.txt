@@ -1,8 +1,8 @@
-# requirements.txt - MongoDB version
 Flask==2.3.3
 Flask-CORS==4.0.0
-Flask-PyMongo==2.3.0
+Flask-SQLAlchemy==3.0.5
 python-dotenv==1.0.0
 Flask-JWT-Extended==4.5.3
-pymongo==4.5.0
-bcrypt==4.1.2  # For password hashing
+psycopg2-binary==2.9.9
+bcrypt==4.1.2
+gunicorn==21.2.0
