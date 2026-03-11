@@ -248,7 +248,7 @@ def seed_data():
             'description': 'The complete Queen Koba system. All 5 products at 15% OFF. Your throne awaits.',
             'base_price_usd': 62.26,
             'category': 'Bundle',
-            'image_url': 'https://www.dropbox.com/scl/fi/xbfgwzkqvfqe2hhybwwhp/er.png?rlkey=jovtvo8ux3daj3m7h2pkkie3c&st=hs1zy0lr&raw=1',
+            'image_url': 'https://www.dropbox.com/scl/fi/jpdncaq9lkmtnhxz3xbli/new.jpeg?rlkey=y6gg1oiji39i52ve9avevqplh&st=zuyfr36d&raw=1',
             'discount_percentage': 15,
             'on_sale': True,
         },
