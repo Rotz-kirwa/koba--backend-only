@@ -1,4 +1,4 @@
-#!/home/user/Public/koba/backend/queen-koba-backend/venv/bin/python3
+#!/home/user/projects/qwens-kobas--1-/backend/koba--backend-only/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

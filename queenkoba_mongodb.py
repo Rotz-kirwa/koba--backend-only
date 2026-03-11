@@ -1477,9 +1477,12 @@ if __name__ == '__main__':
     print("   Burundi: Lumicash, EcoCash, Cards")
     print("   DRC Congo: Orange Money, Vodacom M-Pesa, Cards")
     
+    port = int(os.getenv("PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+
     print("\n🌐 Server URLs:")
-    print("   Local:    http://localhost:5000")
-    print("   Network:  http://0.0.0.0:5000")
+    print(f"   Local:    http://localhost:{port}")
+    print(f"   Network:  http://0.0.0.0:{port}")
     
     print("\n🔑 Default Admin:")
     print("   Email: info@queenkoba.com")
@@ -1489,4 +1492,4 @@ if __name__ == '__main__':
     print("   Starting API... (Press Ctrl+C to stop)")
     print("="*70 + "\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=port, debug=debug, use_reloader=debug)

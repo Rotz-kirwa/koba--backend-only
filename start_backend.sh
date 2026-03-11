@@ -1,10 +1,11 @@
 #!/bin/bash
+set -e
 
-cd /home/user/Public/koba/backend/queen-koba-backend
+cd "$(dirname "$0")"
 
-# Activate virtual environment
-source venv/bin/activate
-
-# Start the backend
-echo "🚀 Starting Queen Koba Backend API..."
-python queenkoba_mongodb.py
+echo "🚀 Starting Queen Koba Backend API (PostgreSQL)..."
+if [ -x "venv/bin/python" ]; then
+  venv/bin/python queenkoba_postgresql.py
+else
+  python3 queenkoba_postgresql.py
+fi
