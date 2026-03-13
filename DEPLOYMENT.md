@@ -49,6 +49,14 @@ git push -u origin main
    JWT_SECRET_KEY = [Generate random string, e.g., use: openssl rand -hex 32]
    FRONTEND_URL = https://your-frontend.vercel.app
    ADMIN_URL = https://your-admin.vercel.app
+   M_PESA_ENV = production
+   M_PESA_CONSUMER_KEY = [Your Safaricom Daraja consumer key]
+   M_PESA_CONSUMER_SECRET = [Your Safaricom Daraja consumer secret]
+   M_PESA_SHORTCODE = [Your Lipa na M-Pesa shortcode / paybill]
+   M_PESA_PASSKEY = [Your Lipa na M-Pesa passkey]
+   M_PESA_CALLBACK_URL = https://your-api-domain.com/payments/mpesa/callback
+   M_PESA_TRANSACTION_TYPE = CustomerPayBillOnline
+   M_PESA_ACCOUNT_REFERENCE = QueenKoba
    PYTHON_VERSION = 3.11.0
    ```
 
@@ -133,6 +141,11 @@ psql YOUR_DATABASE_URL < backup.sql
 ### CORS Errors
 - Add your frontend/admin URLs to `FRONTEND_URL` and `ADMIN_URL` environment variables
 - Restart the service after updating environment variables
+
+### M-Pesa STK Push Notes
+- `M_PESA_CALLBACK_URL` must be a public HTTPS URL reachable by Safaricom.
+- A real STK push also requires a valid `M_PESA_SHORTCODE` and `M_PESA_PASSKEY`.
+- After changing any M-Pesa env vars, redeploy or restart the backend.
 
 ### Slow First Request
 - This is normal on free tier (cold start)

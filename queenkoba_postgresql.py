@@ -6,7 +6,10 @@ from datetime import datetime, timedelta
 import bcrypt
 import uuid
 import os
+import base64
+import json
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
@@ -46,6 +49,9 @@ jwt = JWTManager(app)
 # Initialize database on startup
 @app.before_request
 def initialize_database():
+    if request.method == 'OPTIONS':
+        return jsonify({'status': 'ok'}), 200
+
     if not hasattr(app, 'db_initialized'):
         with app.app_context():
             db.create_all()
@@ -196,61 +202,418 @@ def calculate_prices(base_price_usd):
     
     return prices
 
+def build_prices_from_kes(kes_amount):
+    base_price_usd = kes_amount / 128.5
+    prices = calculate_prices(base_price_usd)
+    prices['KES']['amount'] = kes_amount
+    return prices
+
+def get_mpesa_base_url():
+    env = os.getenv('M_PESA_ENV', 'production').lower()
+    if env == 'sandbox':
+        return 'https://sandbox.safaricom.co.ke'
+    return 'https://api.safaricom.co.ke'
+
+def get_mpesa_config():
+    return {
+        'consumer_key': os.getenv('M_PESA_CONSUMER_KEY', '').strip(),
+        'consumer_secret': os.getenv('M_PESA_CONSUMER_SECRET', '').strip(),
+        'shortcode': os.getenv('M_PESA_SHORTCODE', '').strip(),
+        'passkey': os.getenv('M_PESA_PASSKEY', '').strip(),
+        'callback_url': os.getenv('M_PESA_CALLBACK_URL', '').strip(),
+        'transaction_type': os.getenv('M_PESA_TRANSACTION_TYPE', 'CustomerPayBillOnline').strip(),
+        'account_reference': os.getenv('M_PESA_ACCOUNT_REFERENCE', 'QueenKoba').strip(),
+        'timeout_seconds': int(os.getenv('M_PESA_TIMEOUT_SECONDS', '30') or 30),
+    }
+
+def mpesa_is_configured():
+    config = get_mpesa_config()
+    required = ['consumer_key', 'consumer_secret', 'shortcode', 'passkey', 'callback_url']
+    return all(config.get(key) for key in required)
+
+def get_mpesa_timestamp():
+    return datetime.utcnow().strftime('%Y%m%d%H%M%S')
+
+def build_mpesa_password(shortcode, passkey, timestamp):
+    raw = f"{shortcode}{passkey}{timestamp}"
+    return base64.b64encode(raw.encode('utf-8')).decode('utf-8')
+
+def normalize_mpesa_phone(phone_number):
+    digits = ''.join(ch for ch in str(phone_number or '') if ch.isdigit())
+    if digits.startswith('0') and len(digits) == 10:
+        digits = f"254{digits[1:]}"
+    elif digits.startswith('7') and len(digits) == 9:
+        digits = f"254{digits}"
+    elif digits.startswith('1') and len(digits) == 9:
+        digits = f"254{digits}"
+
+    if len(digits) != 12 or not digits.startswith('254'):
+        raise ValueError('M-Pesa phone number must be in the format 2547XXXXXXXX or 2541XXXXXXXX')
+
+    return digits
+
+def get_mpesa_access_token():
+    config = get_mpesa_config()
+    if not mpesa_is_configured():
+        raise ValueError('M-Pesa is not fully configured. Set consumer key, consumer secret, shortcode, passkey, and callback URL.')
+
+    credentials = f"{config['consumer_key']}:{config['consumer_secret']}"
+    encoded = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
+    response = requests.get(
+        f"{get_mpesa_base_url()}/oauth/v1/generate?grant_type=client_credentials",
+        headers={'Authorization': f"Basic {encoded}"},
+        timeout=config['timeout_seconds'],
+    )
+    response.raise_for_status()
+    data = response.json()
+    token = data.get('access_token')
+    if not token:
+        raise ValueError('Safaricom OAuth token missing from response')
+    return token
+
+def get_order_payment_state(order):
+    if not order.status_note:
+        return {}
+
+    try:
+        return json.loads(order.status_note)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+
+def get_order_note(order):
+    if not order.status_note:
+        return None
+
+    state = get_order_payment_state(order)
+    if state:
+        return state.get('note')
+
+    return order.status_note
+
+def set_order_payment_state(order, **updates):
+    state = get_order_payment_state(order)
+    state.update(updates)
+    order.status_note = json.dumps(state)
+    return state
+
+def append_order_event(order, event_type, message, category='order', actor='system', metadata=None):
+    state = get_order_payment_state(order)
+    events = list(state.get('events') or [])
+    events.append({
+        'type': event_type,
+        'category': category,
+        'message': message,
+        'actor': actor,
+        'metadata': metadata or {},
+        'created_at': datetime.utcnow().isoformat(),
+    })
+    state['events'] = events[-50:]
+    state['last_event_at'] = events[-1]['created_at']
+    order.status_note = json.dumps(state)
+    return state
+
+def build_order_summary_payload(data, user, order_items, total_usd):
+    totals = data.get('totals') or {}
+    payment_details = data.get('payment_details') or {}
+    delivery = data.get('delivery') or {}
+    subtotal_kes = sum(
+        float(item.get('item_total_kes', 0) or 0)
+        for item in order_items
+        if item.get('item_total_kes') is not None
+    )
+    shipping_kes = float(totals.get('shipping_kes', 0) or 0)
+    grand_total_kes = float(totals.get('grand_total_kes', subtotal_kes + shipping_kes) or 0)
+
+    return {
+        'customer': {
+            'user_id': str(user.id) if user else None,
+            'name': (data.get('shipping_address') or {}).get('name') or (user.name if user else None) or (user.username if user else None),
+            'email': (data.get('shipping_address') or {}).get('email') or (user.email if user else None),
+            'phone': (data.get('shipping_address') or {}).get('phone') or (user.phone if user else None),
+        },
+        'totals': {
+            'currency': totals.get('currency', 'KES'),
+            'subtotal_kes': subtotal_kes,
+            'shipping_kes': shipping_kes,
+            'discount_percent': float(totals.get('discount_percent', 0) or 0),
+            'grand_total_kes': grand_total_kes,
+            'total_usd': total_usd,
+        },
+        'payment_details': payment_details,
+        'delivery': delivery,
+    }
+
+def convert_usd_to_kes(amount):
+    return round(float(amount or 0) * 128.5, 2)
+
+def normalize_order_items_for_admin(items):
+    normalized_items = []
+    for item in items or []:
+        normalized = dict(item)
+        quantity = int(normalized.get('quantity', 1) or 1)
+
+        if normalized.get('price_per_item_kes') is None and normalized.get('price_per_item') is not None:
+            normalized['price_per_item_kes'] = convert_usd_to_kes(normalized.get('price_per_item'))
+
+        if normalized.get('item_total_kes') is None:
+            if normalized.get('item_total') is not None:
+                normalized['item_total_kes'] = convert_usd_to_kes(normalized.get('item_total'))
+            else:
+                normalized['item_total_kes'] = float(normalized.get('price_per_item_kes', 0) or 0) * quantity
+
+        normalized_items.append(normalized)
+
+    return normalized_items
+
+def resolve_order_totals_kes(order, state, items):
+    totals = state.get('totals', {}) if isinstance(state, dict) else {}
+
+    subtotal_kes = float(totals.get('subtotal_kes', 0) or 0)
+    shipping_kes = float(totals.get('shipping_kes', 0) or 0)
+    grand_total_kes = float(totals.get('grand_total_kes', 0) or 0)
+    amount_kes = float(state.get('amount_kes', 0) or 0) if isinstance(state, dict) else 0
+
+    items_subtotal_kes = sum(float(item.get('item_total_kes', 0) or 0) for item in items)
+    converted_total_usd_kes = convert_usd_to_kes(order.total_usd) if order.total_usd else 0
+
+    if subtotal_kes <= 0:
+        subtotal_kes = items_subtotal_kes
+
+    if grand_total_kes <= 0:
+        if amount_kes > 0:
+            grand_total_kes = amount_kes
+        elif subtotal_kes > 0 or shipping_kes > 0:
+            grand_total_kes = subtotal_kes + shipping_kes
+        elif converted_total_usd_kes > 0:
+            grand_total_kes = converted_total_usd_kes
+
+    if grand_total_kes > 0 and grand_total_kes < 1 and converted_total_usd_kes > 0:
+        grand_total_kes = converted_total_usd_kes
+
+    if subtotal_kes <= 0 and grand_total_kes > 0:
+        subtotal_kes = max(grand_total_kes - shipping_kes, 0)
+
+    return subtotal_kes, shipping_kes, grand_total_kes
+
+def resolve_payment_status(order, state):
+    if order.payment_method != 'mpesa':
+        return order.payment_status or 'pending'
+
+    result_code = state.get('result_code') if isinstance(state, dict) else None
+    receipt_number = state.get('receipt_number') if isinstance(state, dict) else None
+
+    if receipt_number or str(result_code) == '0':
+        return 'paid'
+
+    if str(result_code) in {'1', '1032', '1037', '2001'} or order.order_status == 'payment_failed':
+        return 'failed'
+
+    if order.payment_status in {'initiated', 'pending', 'failed'}:
+        return order.payment_status
+
+    if order.payment_status == 'paid':
+        return 'pending'
+
+    return order.payment_status or 'pending'
+
+def build_admin_order_payload(order):
+    state = get_order_payment_state(order)
+    customer = state.get('customer', {}) if isinstance(state, dict) else {}
+    payment_details = state.get('payment_details', {}) if isinstance(state, dict) else {}
+    delivery = state.get('delivery', {}) if isinstance(state, dict) else {}
+    receipt_number = state.get('receipt_number')
+    events = list(state.get('events') or [])
+    items = normalize_order_items_for_admin(order.items or [])
+    subtotal_kes, shipping_kes, grand_total_kes = resolve_order_totals_kes(order, state, items)
+
+    shipping_address = order.shipping_address or {}
+    customer_name = customer.get('name') or shipping_address.get('name') or (order.user.name if order.user else None) or (order.user.username if order.user else None)
+    customer_email = customer.get('email') or shipping_address.get('email') or (order.user.email if order.user else None)
+    customer_phone = customer.get('phone') or shipping_address.get('phone') or (order.user.phone if order.user else None)
+    payment_status = resolve_payment_status(order, state)
+
+    return {
+        '_id': str(order.id),
+        'order_id': order.order_id,
+        'user_id': str(order.user_id),
+        'customer_name': customer_name,
+        'customer_email': customer_email,
+        'customer_phone': customer_phone,
+        'items': items,
+        'shipping_address': shipping_address,
+        'delivery': delivery,
+        'payment_method': order.payment_method,
+        'payment_status': payment_status,
+        'payment_details': payment_details,
+        'payment_receipt': receipt_number,
+        'payment_state': state,
+        'events': events,
+        'last_event': events[-1] if events else None,
+        'order_status': order.order_status,
+        'status_note': get_order_note(order),
+        'subtotal_kes': subtotal_kes,
+        'shipping_kes': shipping_kes,
+        'grand_total_kes': grand_total_kes,
+        'discount_percent': float((state.get('totals') or {}).get('discount_percent', 0) or 0),
+        'total_usd': order.total_usd,
+        'created_at': order.created_at.isoformat(),
+        'updated_at': order.updated_at.isoformat() if order.updated_at else None,
+    }
+
+def find_order_by_checkout_request_id(checkout_request_id):
+    if not checkout_request_id:
+        return None
+
+    orders = Order.query.filter_by(payment_method='mpesa').order_by(Order.created_at.desc()).all()
+    for order in orders:
+      state = get_order_payment_state(order)
+      if state.get('checkout_request_id') == checkout_request_id:
+          return order
+    return None
+
+def start_mpesa_stk_push(phone_number, amount_kes, order, description='Queen Koba order payment'):
+    config = get_mpesa_config()
+    if not mpesa_is_configured():
+        raise ValueError('M-Pesa is not fully configured. Set consumer key, consumer secret, shortcode, passkey, and callback URL.')
+
+    normalized_phone = normalize_mpesa_phone(phone_number)
+    timestamp = get_mpesa_timestamp()
+    token = get_mpesa_access_token()
+    payload = {
+        'BusinessShortCode': config['shortcode'],
+        'Password': build_mpesa_password(config['shortcode'], config['passkey'], timestamp),
+        'Timestamp': timestamp,
+        'TransactionType': config['transaction_type'],
+        'Amount': int(round(amount_kes)),
+        'PartyA': normalized_phone,
+        'PartyB': config['shortcode'],
+        'PhoneNumber': normalized_phone,
+        'CallBackURL': config['callback_url'],
+        'AccountReference': order.order_id or config['account_reference'],
+        'TransactionDesc': description[:182],
+    }
+    response = requests.post(
+        f"{get_mpesa_base_url()}/mpesa/stkpush/v1/processrequest",
+        json=payload,
+        headers={'Authorization': f"Bearer {token}"},
+        timeout=config['timeout_seconds'],
+    )
+    response.raise_for_status()
+    return response.json(), normalized_phone
+
+def query_mpesa_stk_status(checkout_request_id):
+    config = get_mpesa_config()
+    if not mpesa_is_configured():
+        raise ValueError('M-Pesa is not fully configured. Set consumer key, consumer secret, shortcode, passkey, and callback URL.')
+
+    timestamp = get_mpesa_timestamp()
+    token = get_mpesa_access_token()
+    payload = {
+        'BusinessShortCode': config['shortcode'],
+        'Password': build_mpesa_password(config['shortcode'], config['passkey'], timestamp),
+        'Timestamp': timestamp,
+        'CheckoutRequestID': checkout_request_id,
+    }
+    response = requests.post(
+        f"{get_mpesa_base_url()}/mpesa/stkpushquery/v1/query",
+        json=payload,
+        headers={'Authorization': f"Bearer {token}"},
+        timeout=config['timeout_seconds'],
+    )
+    response.raise_for_status()
+    return response.json()
+
+def extract_mpesa_callback_metadata(callback_metadata):
+    items = callback_metadata.get('Item', []) if isinstance(callback_metadata, dict) else []
+    metadata = {}
+    for item in items:
+        name = item.get('Name')
+        if name:
+            metadata[name] = item.get('Value')
+    return metadata
+
+def build_mpesa_status_response(order):
+    state = get_order_payment_state(order)
+    return {
+        'order_id': order.order_id,
+        'payment_method': order.payment_method,
+        'payment_status': order.payment_status,
+        'order_status': order.order_status,
+        'checkout_request_id': state.get('checkout_request_id'),
+        'merchant_request_id': state.get('merchant_request_id'),
+        'result_code': state.get('result_code'),
+        'result_desc': state.get('result_desc'),
+        'customer_message': state.get('customer_message'),
+        'receipt_number': state.get('receipt_number'),
+        'phone_number': state.get('phone_number'),
+        'amount_kes': state.get('amount_kes'),
+        'query_error': state.get('query_error'),
+    }
+
+def is_valid_customer_password(password):
+    return isinstance(password, str) and password.isdigit() and len(password) == 4
+
 def seed_data():
     product_catalog = [
         {
-            'name': 'Eternal Radiance - Complexion Clarifying Cleanser',
-            'description': 'Gently purifies melanin-rich skin with Qasil, Liwa, Moringa, and Snail Mucin Extract. 150ml pump bottle.',
-            'base_price_usd': 11.67,
+            'name': 'Complexion Clarifying Cleanser 120ml',
+            'description': 'Erase impurities without stripping moisture. African botanicals gently clarify and prep skin for brighter tone. Feel fresh, confident, and ready to glow.',
+            'base_price_usd': 1899 / 128.5,
             'category': 'Cleanser',
-            'image_url': 'https://www.dropbox.com/scl/fi/cufzkb3xfc8nxror33vv8/qi.jpeg?rlkey=e7k5fboljgna3v2f3yozd179m&st=npyllmfc&raw=1',
+            'image_url': 'https://www.dropbox.com/scl/fi/4tulvx5wuscmhcrvls4tg/sp2.jpeg?rlkey=6lr1shzfkfy14xcl6d7zhqxmd&st=uec69ia4&raw=1',
             'discount_percentage': 0,
             'on_sale': False,
+            'prices': build_prices_from_kes(1899),
         },
         {
-            'name': 'Eternal Radiance - Complexion Clarifying Toner',
-            'description': 'Balances pH and refines pores with Qasil, Liwa, Moringa, and Snail Mucin Extract. 150ml pump bottle.',
-            'base_price_usd': 14.01,
+            'name': 'Brightening Toner 120ml',
+            'description': 'Mist away dullness and balance tone with licorice root and aloe. Soothes instantly and reveals even radiance. Your daily step to luminous skin.',
+            'base_price_usd': 1999 / 128.5,
             'category': 'Toner',
             'image_url': 'https://www.dropbox.com/scl/fi/akek115wovbezb0m923q0/sp3.jpeg?rlkey=w25aqom0rmq40uwmqse84cawb&st=vb6mzc2a&raw=1',
             'discount_percentage': 0,
             'on_sale': False,
+            'prices': build_prices_from_kes(1999),
         },
         {
-            'name': 'Eternal Radiance - Complexion Clarifying Serum',
-            'description': 'Potent treatment with Qasil, Liwa, Moringa, and Snail Mucin Extract for radiant skin. 30ml dropper bottle.',
-            'base_price_usd': 19.46,
+            'name': 'Complexion Clarifying Serum 30ml',
+            'description': 'Target dark spots and hyperpigmentation with liwa and moringa. Fade unevenness and unlock up to 2 shades brighter glow. Feel empowered and radiant.',
+            'base_price_usd': 2499 / 128.5,
             'category': 'Serum',
-            'image_url': 'https://www.dropbox.com/scl/fi/cx0mv6xrjbt2gvy8fa6g3/qi3.jpeg?rlkey=9kbzpvtqi3y9flvj0kt0mfb8y&st=j8hw8fzg&raw=1',
+            'image_url': 'https://www.dropbox.com/scl/fi/ydx5ia5xvcblz5a7d8ty2/sp4.jpeg?rlkey=jy5lypf5j1csv88fy7s33pte9&st=r8air5om&raw=1',
             'discount_percentage': 0,
             'on_sale': False,
+            'prices': build_prices_from_kes(2499),
         },
         {
-            'name': 'Eternal Radiance - Complexion Clarifying Cream',
-            'description': 'Deep hydration with Qasil, Liwa, Moringa, and Snail Mucin Extract to restore your skin barrier. 50ml jar with gold lid.',
-            'base_price_usd': 17.12,
+            'name': 'Complexion Clarifying Cream 50ml',
+            'description': 'Deeply hydrate and plump with shea and snail mucin. Lock in brightness, smooth texture, and boost lasting confidence.',
+            'base_price_usd': 2399 / 128.5,
             'category': 'Cream',
-            'image_url': 'https://www.dropbox.com/scl/fi/3zhgpzx7woqgb3pc8z4pl/qi4.jpeg?rlkey=ntzf2tmkis0mi3gmgsh1j4tqq&st=kwyuk1b5&raw=1',
+            'image_url': 'https://www.dropbox.com/scl/fi/bparrxju6nzi3y816yoc7/sp5.jpeg?rlkey=mae29d7hd4dq88lj4hlvf8fju&st=yqb89dwv&raw=1',
             'discount_percentage': 0,
             'on_sale': False,
+            'prices': build_prices_from_kes(2399),
         },
         {
             'name': 'Brightening Face Mask 120ml',
             'description': 'Weekly reset: Qasil + aloe clarify and brighten, reduce dullness for high-end glow. Pamper yourself to self-love.',
-            'base_price_usd': 9.34,
+            'base_price_usd': 1499 / 128.5,
             'category': 'Mask',
             'image_url': 'https://www.dropbox.com/scl/fi/srxgy8id5smigxy8vtepg/sp6.jpeg?rlkey=4s4p1hq245l9htmf3952f0xnb&st=9jgl6wjw&raw=1',
             'discount_percentage': 0,
             'on_sale': False,
+            'prices': build_prices_from_kes(1499),
         },
         {
-            'name': 'Full Royal Routine',
-            'description': 'The complete Queen Koba system. All 5 products at 15% OFF. Your throne awaits.',
-            'base_price_usd': 62.26,
+            'name': 'Full Product Kit',
+            'description': 'Mask, toner, serum, cream, and cleanser together in one complete routine. The full kit for brighter, even, melanin-safe radiance.',
+            'base_price_usd': 9999 / 128.5,
             'category': 'Bundle',
             'image_url': 'https://www.dropbox.com/scl/fi/jpdncaq9lkmtnhxz3xbli/new.jpeg?rlkey=y6gg1oiji39i52ve9avevqplh&st=zuyfr36d&raw=1',
-            'discount_percentage': 15,
-            'on_sale': True,
+            'discount_percentage': 0,
+            'on_sale': False,
+            'prices': build_prices_from_kes(9999),
         },
     ]
 
@@ -292,7 +655,7 @@ def seed_data():
             )
             db.session.add(product)
 
-        product.prices = calculate_prices(product.base_price_usd)
+        product.prices = item.get('prices', calculate_prices(product.base_price_usd))
         synced += 1
 
     db.session.commit()
@@ -383,6 +746,9 @@ def signup():
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'message': 'Email already registered'}), 400
 
+    if not is_valid_customer_password(data['password']):
+        return jsonify({'message': 'Password must be exactly 4 digits'}), 400
+
     user = User(
         name=data['name'],
         username=data.get('username', data['name']),
@@ -426,6 +792,9 @@ def register():
 
     if not username or not email or not password:
         return jsonify({'message': 'Username, email and password required'}), 400
+
+    if not is_valid_customer_password(password):
+        return jsonify({'message': 'Password must be exactly 4 digits'}), 400
 
     if User.query.filter_by(email=email).first():
         return jsonify({'message': 'Email already registered'}), 400
@@ -471,6 +840,9 @@ def login():
 
     if not data.get('email') or not data.get('password'):
         return jsonify({'message': 'Email and password required'}), 400
+
+    if not is_valid_customer_password(data['password']):
+        return jsonify({'message': 'Password must be exactly 4 digits'}), 400
 
     user = User.query.filter_by(email=data['email']).first()
     if not user or not bcrypt.checkpw(data['password'].encode('utf-8'), user.password_hash.encode('utf-8')):
@@ -580,46 +952,288 @@ def remove_from_cart(product_id):
 @jwt_required()
 def checkout():
     user_id = int(get_jwt_identity())
-    data = request.get_json()
+    data = request.get_json() or {}
+    user = User.query.get(user_id)
     
     cart_items = CartItem.query.filter_by(user_id=user_id).all()
-    if not cart_items:
-        return jsonify({'error': 'Cart is empty'}), 400
-    
     total_usd = 0
     order_items = []
-    
-    for item in cart_items:
-        item_total = item.product.base_price_usd * item.quantity
-        total_usd += item_total
-        order_items.append({
-            'product_id': str(item.product_id),
-            'product_name': item.product.name,
-            'quantity': item.quantity,
-            'price_per_item': item.product.base_price_usd,
-            'item_total': item_total
-        })
-    
+
+    if cart_items:
+        for item in cart_items:
+            item_total = item.product.base_price_usd * item.quantity
+            total_usd += item_total
+            order_items.append({
+                'product_id': str(item.product_id),
+                'product_name': item.product.name,
+                'quantity': item.quantity,
+                'price_per_item': item.product.base_price_usd,
+                'item_total': item_total
+            })
+    else:
+        payload_items = data.get('items') or []
+        totals = data.get('totals') or {}
+
+        if not payload_items:
+            return jsonify({'message': 'Cart is empty'}), 400
+
+        currency = totals.get('currency', 'KES')
+        grand_total = float(totals.get('grand_total_kes', 0) or 0)
+        if currency == 'KES' and grand_total > 0:
+            total_usd = round(grand_total / 128.5, 2)
+        else:
+            total_usd = round(float(totals.get('grand_total', 0) or 0), 2)
+
+        for item in payload_items:
+            quantity = int(item.get('quantity', 1) or 1)
+            price_per_item_kes = float(item.get('price_per_item_kes', 0) or 0)
+            item_total_kes = float(item.get('item_total_kes', price_per_item_kes * quantity) or 0)
+            order_items.append({
+                'product_id': str(item.get('product_id', 'local')),
+                'product_name': item.get('product_name', 'Queen Koba Product'),
+                'quantity': quantity,
+                'price_per_item_kes': price_per_item_kes,
+                'item_total_kes': item_total_kes,
+            })
+
+    payment_method = data.get('payment_method', 'card')
     order = Order(
         order_id=str(uuid.uuid4())[:8].upper(),
         user_id=user_id,
         items=order_items,
         total_usd=total_usd,
         shipping_address=data.get('shipping_address', {}),
-        payment_method=data.get('payment_method', 'card'),
+        payment_method=payment_method,
         payment_status='pending',
         order_status='processing'
     )
-    
+
     db.session.add(order)
+    db.session.flush()
+    set_order_payment_state(
+        order,
+        **build_order_summary_payload(data, user, order_items, total_usd),
+    )
+    append_order_event(
+        order,
+        event_type='order_created',
+        category='order',
+        message=f"Order created with {len(order_items)} item(s) totaling KSh {float((data.get('totals') or {}).get('grand_total_kes', 0) or 0):,.0f}.",
+        metadata={
+            'payment_method': payment_method,
+            'item_count': len(order_items),
+        },
+    )
+
+    if payment_method == 'mpesa':
+        totals = data.get('totals') or {}
+        grand_total_kes = float(totals.get('grand_total_kes', 0) or 0)
+        payment_details = data.get('payment_details') or {}
+        phone_number = payment_details.get('phone_number')
+
+        if grand_total_kes <= 0:
+            db.session.rollback()
+            return jsonify({'message': 'A valid KES total is required for M-Pesa checkout'}), 400
+
+        if not phone_number:
+            db.session.rollback()
+            return jsonify({'message': 'An M-Pesa phone number is required'}), 400
+
+        try:
+            stk_response, normalized_phone = start_mpesa_stk_push(
+                phone_number=phone_number,
+                amount_kes=grand_total_kes,
+                order=order,
+                description=f"Queen Koba order {order.order_id}",
+            )
+        except ValueError as error:
+            db.session.rollback()
+            return jsonify({'message': str(error)}), 400
+        except requests.RequestException as error:
+            db.session.rollback()
+            response_text = error.response.text if error.response is not None else 'Unable to reach Safaricom'
+            return jsonify({
+                'message': 'Failed to initiate M-Pesa STK push',
+                'details': response_text,
+            }), 502
+
+        set_order_payment_state(
+            order,
+            provider='mpesa',
+            phone_number=normalized_phone,
+            amount_kes=int(round(grand_total_kes)),
+            merchant_request_id=stk_response.get('MerchantRequestID'),
+            checkout_request_id=stk_response.get('CheckoutRequestID'),
+            customer_message=stk_response.get('CustomerMessage'),
+            response_code=stk_response.get('ResponseCode'),
+            response_description=stk_response.get('ResponseDescription'),
+            result_code=None,
+            result_desc=None,
+        )
+        append_order_event(
+            order,
+            event_type='mpesa_stk_initiated',
+            category='payment',
+            message=f"M-Pesa STK push initiated to {normalized_phone}.",
+            metadata={
+                'phone_number': normalized_phone,
+                'amount_kes': int(round(grand_total_kes)),
+                'checkout_request_id': stk_response.get('CheckoutRequestID'),
+            },
+        )
+        order.payment_status = 'initiated'
+        order.order_status = 'processing'
+        db.session.commit()
+
+        return jsonify({
+            'status': 'success',
+            'order_id': order.order_id,
+            'total': total_usd,
+            'payment': {
+                'provider': 'mpesa',
+                'status': order.payment_status,
+                'customer_message': stk_response.get('CustomerMessage'),
+                'checkout_request_id': stk_response.get('CheckoutRequestID'),
+                'merchant_request_id': stk_response.get('MerchantRequestID'),
+            }
+        })
+
     CartItem.query.filter_by(user_id=user_id).delete()
+    append_order_event(
+        order,
+        event_type='payment_recorded',
+        category='payment',
+        message=f"Order recorded with {payment_method} payment method.",
+        metadata={'payment_method': payment_method, 'payment_status': order.payment_status},
+    )
     db.session.commit()
-    
+
     return jsonify({
         'status': 'success',
         'order_id': order.order_id,
         'total': total_usd
     })
+
+@app.route('/payments/mpesa/callback', methods=['POST'])
+def mpesa_callback():
+    data = request.get_json(silent=True) or {}
+    callback = (
+        data.get('Body', {})
+        .get('stkCallback', {})
+    )
+    checkout_request_id = callback.get('CheckoutRequestID')
+    order = find_order_by_checkout_request_id(checkout_request_id)
+
+    if order:
+        result_code = callback.get('ResultCode')
+        result_desc = callback.get('ResultDesc')
+        metadata = extract_mpesa_callback_metadata(callback.get('CallbackMetadata', {}))
+
+        set_order_payment_state(
+            order,
+            result_code=result_code,
+            result_desc=result_desc,
+            receipt_number=metadata.get('MpesaReceiptNumber'),
+            transaction_date=metadata.get('TransactionDate'),
+            amount_kes=metadata.get('Amount') or get_order_payment_state(order).get('amount_kes'),
+            phone_number=metadata.get('PhoneNumber') or get_order_payment_state(order).get('phone_number'),
+            callback_payload=data,
+        )
+        order.payment_status = 'paid' if result_code == 0 else 'failed'
+        order.order_status = 'processing' if result_code == 0 else 'payment_failed'
+        append_order_event(
+            order,
+            event_type='mpesa_callback_received',
+            category='payment',
+            message='M-Pesa callback confirmed payment.' if result_code == 0 else f"M-Pesa callback reported failure: {result_desc}",
+            metadata={
+                'result_code': result_code,
+                'result_desc': result_desc,
+                'receipt_number': metadata.get('MpesaReceiptNumber'),
+            },
+        )
+        db.session.commit()
+
+    return jsonify({'ResultCode': 0, 'ResultDesc': 'Accepted'})
+
+@app.route('/payments/mpesa/status/<string:order_ref>', methods=['GET'])
+@jwt_required()
+def mpesa_status(order_ref):
+    user_id = int(get_jwt_identity())
+    order = Order.query.filter_by(order_id=order_ref, user_id=user_id).first()
+    if not order:
+        return jsonify({'message': 'Order not found'}), 404
+
+    if order.payment_method != 'mpesa':
+        return jsonify({'message': 'Order is not an M-Pesa payment'}), 400
+
+    if order.payment_status in ['paid', 'failed']:
+        return jsonify({'status': 'success', 'payment': build_mpesa_status_response(order)})
+
+    state = get_order_payment_state(order)
+    checkout_request_id = state.get('checkout_request_id')
+    if not checkout_request_id:
+        return jsonify({'status': 'success', 'payment': build_mpesa_status_response(order)})
+
+    try:
+        query_response = query_mpesa_stk_status(checkout_request_id)
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
+    except requests.RequestException as error:
+        response_text = error.response.text if error.response is not None else 'Unable to reach Safaricom'
+        set_order_payment_state(
+            order,
+            query_error=response_text,
+        )
+        append_order_event(
+            order,
+            event_type='mpesa_status_query_delayed',
+            category='payment',
+            message='M-Pesa status query is temporarily unavailable. Waiting for callback or next poll.',
+            metadata={'details': response_text},
+        )
+        db.session.commit()
+        return jsonify({
+            'status': 'success',
+            'payment': build_mpesa_status_response(order),
+        })
+
+    result_code_raw = query_response.get('ResultCode')
+    result_code = int(result_code_raw) if str(result_code_raw).isdigit() else result_code_raw
+    result_desc = query_response.get('ResultDesc')
+    if result_code == 0:
+        order.payment_status = 'paid'
+        order.order_status = 'processing'
+    elif result_code in [1032, 1037, 2001, 1]:
+        order.payment_status = 'failed'
+        order.order_status = 'payment_failed'
+
+    set_order_payment_state(
+        order,
+        result_code=result_code,
+        result_desc=result_desc,
+        query_payload=query_response,
+        query_error=None,
+    )
+    if result_code == 0:
+        append_order_event(
+            order,
+            event_type='mpesa_status_confirmed',
+            category='payment',
+            message='M-Pesa payment confirmed from status query.',
+            metadata={'result_code': result_code, 'result_desc': result_desc},
+        )
+    elif result_code in [1032, 1037, 2001, 1]:
+        append_order_event(
+            order,
+            event_type='mpesa_status_failed',
+            category='payment',
+            message=f"M-Pesa status query reported failure: {result_desc}",
+            metadata={'result_code': result_code, 'result_desc': result_desc},
+        )
+    db.session.commit()
+
+    return jsonify({'status': 'success', 'payment': build_mpesa_status_response(order)})
 
 @app.route('/orders', methods=['GET'])
 @jwt_required()
@@ -692,22 +1306,59 @@ def admin_login():
 @app.route('/admin/dashboard/kpis', methods=['GET'])
 @jwt_required()
 def get_dashboard_kpis():
-    thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-    
-    total_revenue = db.session.query(db.func.sum(Order.total_usd)).filter(
-        Order.created_at >= thirty_days_ago,
-        Order.payment_status == 'paid'
-    ).scalar() or 0
-    
-    total_orders = Order.query.filter(Order.created_at >= thirty_days_ago).count()
-    total_customers = User.query.filter_by(role='customer').count()
-    
+    now = datetime.utcnow()
+    thirty_days_ago = now - timedelta(days=30)
+    sixty_days_ago = now - timedelta(days=60)
+
+    def build_period_metrics(start_at, end_at):
+        period_orders = Order.query.filter(
+            Order.created_at >= start_at,
+            Order.created_at < end_at,
+        ).all()
+        paid_period_orders = [
+            order for order in period_orders
+            if build_admin_order_payload(order).get('payment_status') == 'paid'
+        ]
+        revenue = sum(
+            float(build_admin_order_payload(order).get('grand_total_kes', 0) or 0)
+            for order in paid_period_orders
+        )
+        orders_count = len(period_orders)
+        customers_count = User.query.filter(
+            User.role == 'customer',
+            User.created_at >= start_at,
+            User.created_at < end_at,
+        ).count()
+        conversion_rate = round((len(paid_period_orders) / orders_count) * 100, 1) if orders_count else 0
+        return {
+            'revenue': revenue,
+            'orders_count': orders_count,
+            'customers_count': customers_count,
+            'conversion_rate': conversion_rate,
+        }
+
+    def trend_percent(current, previous):
+        current = float(current or 0)
+        previous = float(previous or 0)
+        if previous == 0:
+            return 0 if current == 0 else 100
+        return round(((current - previous) / previous) * 100, 1)
+
+    current = build_period_metrics(thirty_days_ago, now)
+    previous = build_period_metrics(sixty_days_ago, thirty_days_ago)
+
     return jsonify({
-        'total_revenue': total_revenue,
-        'total_orders': total_orders,
-        'total_customers': total_customers,
-        'conversion_rate': 3.2,
-        'low_stock_items': Product.query.filter_by(in_stock=False).count()
+        'total_revenue': current['revenue'],
+        'total_orders': current['orders_count'],
+        'total_customers': User.query.filter_by(role='customer').count(),
+        'conversion_rate': current['conversion_rate'],
+        'low_stock_items': Product.query.filter_by(in_stock=False).count(),
+        'expiring_soon': 0,
+        'expiring_soon_tracked': False,
+        'revenue_change': trend_percent(current['revenue'], previous['revenue']),
+        'orders_change': trend_percent(current['orders_count'], previous['orders_count']),
+        'customers_change': trend_percent(current['customers_count'], previous['customers_count']),
+        'conversion_change': trend_percent(current['conversion_rate'], previous['conversion_rate']),
     })
 
 @app.route('/admin/products', methods=['GET', 'POST'])
@@ -788,18 +1439,7 @@ def admin_product(product_id):
 def admin_get_orders():
     orders = Order.query.order_by(Order.created_at.desc()).limit(50).all()
     return jsonify({
-        'orders': [{
-            '_id': str(o.id),
-            'order_id': o.order_id,
-            'user_id': str(o.user_id),
-            'customer_email': o.user.email if o.user else None,
-            'total_usd': o.total_usd,
-            'items': o.items,
-            'shipping_address': o.shipping_address,
-            'payment_status': o.payment_status,
-            'order_status': o.order_status,
-            'created_at': o.created_at.isoformat()
-        } for o in orders]
+        'orders': [build_admin_order_payload(o) for o in orders]
     })
 
 @app.route('/admin/orders/<int:order_id>/status', methods=['PUT'])
@@ -814,7 +1454,15 @@ def admin_update_order_status(order_id):
 
     order.order_status = new_status
     if data.get('note'):
-        order.status_note = data.get('note')
+        set_order_payment_state(order, note=data.get('note'))
+    append_order_event(
+        order,
+        event_type='admin_status_updated',
+        category='order',
+        actor='admin',
+        message=f"Order status changed to {new_status}.",
+        metadata={'status': new_status, 'note': data.get('note')},
+    )
     order.updated_at = datetime.utcnow()
     db.session.commit()
     return jsonify({'status': 'success', 'message': 'Order status updated'})
@@ -823,14 +1471,39 @@ def admin_update_order_status(order_id):
 @jwt_required()
 def admin_get_customers():
     customers = User.query.filter_by(role='customer').limit(50).all()
+
+    payload = []
+    for customer in customers:
+        customer_orders = Order.query.filter_by(user_id=customer.id).order_by(Order.created_at.desc()).all()
+        order_payloads = [build_admin_order_payload(order) for order in customer_orders]
+        total_spent_kes = sum(
+            float(order.get('grand_total_kes', 0) or 0)
+            for order in order_payloads
+            if order.get('payment_status') == 'paid'
+        )
+        cart_items = CartItem.query.filter_by(user_id=customer.id).all()
+
+        payload.append({
+            '_id': str(customer.id),
+            'name': customer.name or customer.username,
+            'username': customer.username or customer.name,
+            'email': customer.email,
+            'phone': customer.phone,
+            'country': customer.country or 'Kenya',
+            'preferred_currency': customer.preferred_currency or 'KES',
+            'role': customer.role,
+            'created_at': customer.created_at.isoformat(),
+            'orders': order_payloads,
+            'total_spent': total_spent_kes,
+            'total_spent_kes': total_spent_kes,
+            'cart': [{
+                'product_id': item.product_id,
+                'quantity': item.quantity,
+            } for item in cart_items]
+        })
+
     return jsonify({
-        'customers': [{
-            '_id': str(c.id),
-            'name': c.name or c.username,
-            'email': c.email,
-            'phone': c.phone,
-            'created_at': c.created_at.isoformat()
-        } for c in customers]
+        'customers': payload
     })
 
 @app.route('/admin/profile/password', methods=['PUT'])
@@ -1075,14 +1748,30 @@ def admin_update_promotion_status(promo_id):
 @jwt_required()
 def admin_get_payments():
     orders = Order.query.order_by(Order.created_at.desc()).all()
-    payments = [{
-        '_id': str(o.id),
-        'order_id': o.order_id,
-        'amount': o.total_usd,
-        'payment_method': o.payment_method,
-        'payment_status': o.payment_status,
-        'created_at': o.created_at.isoformat()
-    } for o in orders]
+    payments = []
+    for order in orders:
+        payload = build_admin_order_payload(order)
+        payments.append({
+            '_id': payload['_id'],
+            'order_id': payload['order_id'],
+            'customer_name': payload['customer_name'],
+            'customer_email': payload['customer_email'],
+            'customer_phone': payload['customer_phone'],
+            'amount': payload['grand_total_kes'],
+            'amount_kes': payload['grand_total_kes'],
+            'subtotal_kes': payload['subtotal_kes'],
+            'shipping_kes': payload['shipping_kes'],
+            'discount_percent': payload['discount_percent'],
+            'payment_method': payload['payment_method'],
+            'payment_status': payload['payment_status'],
+            'order_status': payload['order_status'],
+            'payment_receipt': payload['payment_receipt'],
+            'payment_details': payload['payment_details'],
+            'events': payload['events'],
+            'last_event': payload['last_event'],
+            'created_at': payload['created_at'],
+            'updated_at': payload['updated_at'],
+        })
     return jsonify({'payments': payments})
 
 @app.route('/admin/shipping-zones', methods=['GET', 'POST'])
