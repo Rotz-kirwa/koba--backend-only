@@ -906,7 +906,108 @@ def resolve_order_items_for_checkout(user_id, data):
 
     raise ValueError('Cart is empty')
 
+DELIVERY_ZONE_RULES = {
+    'nairobi': {
+        'code': 'nairobi',
+        'label': 'Within Nairobi',
+        'shipping_fee': 300.0,
+        'eta': 'Same day / next day',
+    },
+    'outside_nairobi': {
+        'code': 'outside_nairobi',
+        'label': 'Outside Nairobi',
+        'shipping_fee': 500.0,
+        'eta': '2-4 business days',
+    },
+}
+
+def normalize_delivery_text(value):
+    return ' '.join(str(value or '').split()).strip()
+
+def normalize_delivery_zone(value):
+    normalized = normalize_delivery_text(value).lower().replace('-', '_').replace(' ', '_')
+    if normalized in {'nairobi', 'within_nairobi'}:
+        return 'nairobi'
+    if normalized in {'outside_nairobi', 'outside'}:
+        return 'outside_nairobi'
+    if normalized:
+        return 'outside_nairobi'
+    return None
+
+def get_delivery_zone_rule(data):
+    delivery = data.get('delivery') or {}
+    shipping_address = data.get('shipping_address') or {}
+    zone_candidate = (
+        delivery.get('delivery_zone_code')
+        or delivery.get('delivery_zone')
+        or delivery.get('zone')
+        or shipping_address.get('delivery_zone_code')
+        or shipping_address.get('delivery_zone')
+        or shipping_address.get('zone')
+        or delivery.get('county')
+    )
+    normalized_zone = normalize_delivery_zone(zone_candidate)
+    return DELIVERY_ZONE_RULES.get(normalized_zone)
+
+def build_validated_delivery_payload(data):
+    shipping_address = dict(data.get('shipping_address') or {})
+    delivery = dict(data.get('delivery') or {})
+    delivery_rule = get_delivery_zone_rule(data)
+    if not delivery_rule:
+        raise ValueError('Choose a valid delivery zone before checkout')
+
+    county = normalize_delivery_text(delivery.get('county') or shipping_address.get('county'))
+    area = normalize_delivery_text(delivery.get('area') or shipping_address.get('area'))
+    delivery_point = normalize_delivery_text(
+        delivery.get('delivery_point')
+        or delivery.get('point')
+        or shipping_address.get('delivery_point')
+    )
+    delivery_method = normalize_delivery_text(
+        delivery.get('method') or shipping_address.get('delivery_method') or 'pickup'
+    ).lower()
+    if delivery_method not in {'pickup', 'door'}:
+        delivery_method = 'pickup'
+
+    if not county:
+        raise ValueError('County is required before checkout')
+    if not area:
+        raise ValueError('Area / Town / Estate is required before checkout')
+    if not delivery_point:
+        raise ValueError('Exact delivery point is required before checkout')
+
+    shipping_fee = float(delivery_rule['shipping_fee'])
+    eta = delivery_rule['eta']
+
+    shipping_address.update({
+        'county': county,
+        'area': area,
+        'delivery_point': delivery_point,
+        'delivery_zone': delivery_rule['label'],
+        'delivery_zone_code': delivery_rule['code'],
+        'delivery_method': delivery_method,
+        'delivery_eta': eta,
+    })
+
+    delivery.update({
+        'county': county,
+        'area': area,
+        'point': delivery_point,
+        'delivery_point': delivery_point,
+        'delivery_zone': delivery_rule['label'],
+        'delivery_zone_code': delivery_rule['code'],
+        'method': delivery_method,
+        'shipping_fee': shipping_fee,
+        'eta': eta,
+    })
+
+    return shipping_address, delivery, shipping_fee
+
 def resolve_shipping_kes(data):
+    delivery_rule = get_delivery_zone_rule(data)
+    if delivery_rule:
+        return float(delivery_rule['shipping_fee'])
+
     delivery = data.get('delivery') or {}
     totals = data.get('totals') or {}
     return max(parse_float(delivery.get('shipping_fee', totals.get('shipping_kes')), 0), 0)
@@ -2019,28 +2120,35 @@ def checkout():
     user_id = int(get_jwt_identity())
     data = request.get_json() or {}
     user = User.query.get(user_id)
-    
+
     try:
-        order_items = resolve_order_items_for_checkout(user_id, data)
+        shipping_address, delivery_payload, shipping_kes = build_validated_delivery_payload(data)
     except ValueError as error:
         return jsonify({'message': str(error)}), 400
 
-    shipping_kes = resolve_shipping_kes(data)
+    checkout_data = dict(data)
+    checkout_data['shipping_address'] = shipping_address
+    checkout_data['delivery'] = delivery_payload
+    
+    try:
+        order_items = resolve_order_items_for_checkout(user_id, checkout_data)
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
 
     try:
-        promo_summary = resolve_promotion_for_checkout(user, data, order_items, shipping_kes)
+        promo_summary = resolve_promotion_for_checkout(user, checkout_data, order_items, shipping_kes)
     except ValueError as error:
         return jsonify({'message': str(error)}), 400
 
     total_usd = round(float(promo_summary.get('final_total_kes', 0) or 0) / 128.5, 2)
 
-    payment_method = data.get('payment_method', 'card')
+    payment_method = checkout_data.get('payment_method', 'card')
     order = Order(
         order_id=str(uuid.uuid4())[:8].upper(),
         user_id=user_id,
         items=order_items,
         total_usd=total_usd,
-        shipping_address=data.get('shipping_address', {}),
+        shipping_address=shipping_address,
         payment_method=payment_method,
         payment_status='pending',
         order_status='processing',
@@ -2056,7 +2164,7 @@ def checkout():
     db.session.flush()
     set_order_payment_state(
         order,
-        **build_order_summary_payload(data, user, order_items, total_usd, promo_summary),
+        **build_order_summary_payload(checkout_data, user, order_items, total_usd, promo_summary),
     )
     append_order_event(
         order,

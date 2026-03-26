@@ -73,7 +73,18 @@ class CheckoutPromotionTests(unittest.TestCase):
             }
             return request_item, float(order_item["item_total_kes"])
 
-    def _checkout_payload(self, items, shipping_fee, promo_code=None):
+    def _checkout_payload(
+        self,
+        items,
+        shipping_fee,
+        promo_code=None,
+        *,
+        delivery_zone="nairobi",
+        county="Nairobi",
+        area="CBD",
+        delivery_point="Kencom stage",
+    ):
+        delivery_zone_label = "Within Nairobi" if delivery_zone == "nairobi" else "Outside Nairobi"
         return {
             "items": items,
             "totals": {
@@ -90,12 +101,21 @@ class CheckoutPromotionTests(unittest.TestCase):
                 "city": "Nairobi",
                 "postal_code": "00100",
                 "country": "Kenya",
+                "county": county,
+                "area": area,
+                "delivery_zone": delivery_zone_label,
+                "delivery_zone_code": delivery_zone,
+                "delivery_point": delivery_point,
             },
             "payment_method": "card",
             "payment_details": {"type": "card"},
             "delivery": {
-                "county": "Nairobi",
-                "point": "CBD",
+                "delivery_zone": delivery_zone_label,
+                "delivery_zone_code": delivery_zone,
+                "county": county,
+                "area": area,
+                "point": delivery_point,
+                "delivery_point": delivery_point,
                 "method": "pickup",
                 "shipping_fee": shipping_fee,
                 "eta": "1-2 days",
@@ -171,7 +191,15 @@ class CheckoutPromotionTests(unittest.TestCase):
 
         response = self.client.post(
             "/checkout",
-            json=self._checkout_payload([bundle_item], shipping_fee=450, promo_code="FREEDELIVERY"),
+            json=self._checkout_payload(
+                [bundle_item],
+                shipping_fee=450,
+                promo_code="FREEDELIVERY",
+                delivery_zone="outside_nairobi",
+                county="Nakuru",
+                area="Nakuru Town",
+                delivery_point="Stage ya posta",
+            ),
             headers=self._auth_headers(),
         )
         self.assertEqual(response.status_code, 200)
@@ -179,8 +207,51 @@ class CheckoutPromotionTests(unittest.TestCase):
 
         self.assertEqual(promo["promo_code"], "FREEDELIVERY")
         self.assertAlmostEqual(promo["discount_amount"], 0)
-        self.assertAlmostEqual(promo["shipping_discount"], 450)
+        self.assertAlmostEqual(promo["shipping_discount"], 500)
         self.assertAlmostEqual(promo["final_total_kes"], bundle_subtotal)
+
+    def test_outside_nairobi_shipping_is_recalculated_server_side(self):
+        serum_item, serum_subtotal = self._catalog_item("Serum")
+
+        response = self.client.post(
+            "/checkout",
+            json=self._checkout_payload(
+                [serum_item],
+                shipping_fee=0,
+                delivery_zone="outside_nairobi",
+                county="Nakuru",
+                area="Nakuru Town",
+                delivery_point="Stage ya posta",
+            ),
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        promo = response.get_json()["promo"]
+        self.assertAlmostEqual(promo["shipping_kes"], 500)
+        self.assertAlmostEqual(promo["final_total_kes"], round(serum_subtotal + 500, 2))
+
+        with backend.app.app_context():
+            order = backend.Order.query.filter_by(order_id=response.get_json()["order_id"]).first()
+            self.assertIsNotNone(order)
+            self.assertEqual((order.shipping_address or {}).get("delivery_zone_code"), "outside_nairobi")
+            self.assertEqual((order.shipping_address or {}).get("county"), "Nakuru")
+            self.assertEqual((order.shipping_address or {}).get("area"), "Nakuru Town")
+
+    def test_checkout_rejects_missing_structured_delivery_fields(self):
+        serum_item, _ = self._catalog_item("Serum")
+        payload = self._checkout_payload([serum_item], shipping_fee=300)
+        payload["delivery"]["county"] = ""
+        payload["shipping_address"]["county"] = ""
+
+        response = self.client.post(
+            "/checkout",
+            json=payload,
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("county is required", response.get_json()["message"].lower())
 
     def test_melanin15_only_applies_to_eligible_categories(self):
         cleanser_item, _ = self._catalog_item("Cleanser", quantity=2)
