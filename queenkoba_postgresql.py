@@ -1,8 +1,9 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
-from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
-from datetime import datetime, timedelta
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, verify_jwt_in_request
+from datetime import datetime, timedelta, timezone
+from functools import wraps
 import bcrypt
 import uuid
 import os
@@ -57,6 +58,7 @@ def initialize_database():
     if not hasattr(app, 'db_initialized'):
         with app.app_context():
             db.create_all()
+            ensure_schema_updates()
             seed_data()
             app.db_initialized = True
 
@@ -79,6 +81,7 @@ class User(db.Model):
     
     cart_items = db.relationship('CartItem', backref='user', lazy=True, cascade='all, delete-orphan')
     orders = db.relationship('Order', backref='user', lazy=True)
+    promotion_usages = db.relationship('PromotionUsage', backref='user', lazy=True)
 
 class Product(db.Model):
     __tablename__ = 'products'
@@ -117,6 +120,12 @@ class Order(db.Model):
     payment_status = db.Column(db.String(20), default='pending')
     order_status = db.Column(db.String(20), default='processing')
     status_note = db.Column(db.Text)
+    promo_code_id = db.Column(db.Integer, db.ForeignKey('promotions.id'))
+    promo_code = db.Column(db.String(50))
+    discount_type = db.Column(db.String(20))
+    discount_amount = db.Column(db.Float, default=0)
+    shipping_discount = db.Column(db.Float, default=0)
+    final_total_after_discount = db.Column(db.Float, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -124,13 +133,67 @@ class Promotion(db.Model):
     __tablename__ = 'promotions'
     id = db.Column(db.Integer, primary_key=True)
     code = db.Column(db.String(50), unique=True)
+    description = db.Column(db.Text)
+    internal_notes = db.Column(db.Text)
     discount = db.Column(db.Float)
     type = db.Column(db.String(20))
     status = db.Column(db.String(20), default='active')
     uses = db.Column(db.Integer, default=0)
     limit = db.Column(db.Integer)
+    per_user_limit = db.Column(db.Integer)
+    min_order_amount = db.Column(db.Float, default=0)
+    max_discount_amount = db.Column(db.Float)
+    first_order_only = db.Column(db.Boolean, default=False)
+    starts_at = db.Column(db.DateTime)
     expires = db.Column(db.DateTime)
+    applies_to_type = db.Column(db.String(20), default='all')
+    customer_scope = db.Column(db.String(20), default='all')
+    campaign_type = db.Column(db.String(50))
+    created_by_admin_id = db.Column(db.Integer, db.ForeignKey('users.id'))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    created_by_admin = db.relationship('User', foreign_keys=[created_by_admin_id])
+    usages = db.relationship('PromotionUsage', backref='promotion', lazy=True, cascade='all, delete-orphan')
+    product_links = db.relationship('PromotionProduct', backref='promotion', lazy=True, cascade='all, delete-orphan')
+    category_links = db.relationship('PromotionCategory', backref='promotion', lazy=True, cascade='all, delete-orphan')
+    user_links = db.relationship('PromotionUser', backref='promotion', lazy=True, cascade='all, delete-orphan')
+
+class PromotionUsage(db.Model):
+    __tablename__ = 'promotion_usages'
+    id = db.Column(db.Integer, primary_key=True)
+    promo_code_id = db.Column(db.Integer, db.ForeignKey('promotions.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False, unique=True)
+    discount_amount = db.Column(db.Float, default=0)
+    shipping_discount = db.Column(db.Float, default=0)
+    subtotal_kes = db.Column(db.Float, default=0)
+    final_total_kes = db.Column(db.Float, default=0)
+    used_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    order = db.relationship('Order')
+
+class PromotionProduct(db.Model):
+    __tablename__ = 'promotion_products'
+    id = db.Column(db.Integer, primary_key=True)
+    promo_code_id = db.Column(db.Integer, db.ForeignKey('promotions.id'), nullable=False)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=False)
+
+    product = db.relationship('Product')
+
+class PromotionCategory(db.Model):
+    __tablename__ = 'promotion_categories'
+    id = db.Column(db.Integer, primary_key=True)
+    promo_code_id = db.Column(db.Integer, db.ForeignKey('promotions.id'), nullable=False)
+    category = db.Column(db.String(100), nullable=False)
+
+class PromotionUser(db.Model):
+    __tablename__ = 'promotion_users'
+    id = db.Column(db.Integer, primary_key=True)
+    promo_code_id = db.Column(db.Integer, db.ForeignKey('promotions.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+
+    user = db.relationship('User')
 
 class Review(db.Model):
     __tablename__ = 'reviews'
@@ -174,6 +237,107 @@ class SiteContent(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 # ========== HELPER FUNCTIONS ==========
+def ensure_schema_updates():
+    inspector = db.inspect(db.engine)
+    table_names = set(inspector.get_table_names())
+    columns_by_table = {
+        table_name: {column['name'] for column in inspector.get_columns(table_name)}
+        for table_name in table_names
+    }
+
+    required_columns = {
+        'orders': {
+            'promo_code_id': 'INTEGER',
+            'promo_code': 'VARCHAR(50)',
+            'discount_type': 'VARCHAR(20)',
+            'discount_amount': 'FLOAT',
+            'shipping_discount': 'FLOAT',
+            'final_total_after_discount': 'FLOAT',
+        },
+        'promotions': {
+            'description': 'TEXT',
+            'internal_notes': 'TEXT',
+            'per_user_limit': 'INTEGER',
+            'min_order_amount': 'FLOAT',
+            'max_discount_amount': 'FLOAT',
+            'first_order_only': 'BOOLEAN',
+            'starts_at': 'TIMESTAMP',
+            'applies_to_type': 'VARCHAR(20)',
+            'customer_scope': 'VARCHAR(20)',
+            'campaign_type': 'VARCHAR(50)',
+            'created_by_admin_id': 'INTEGER',
+            'updated_at': 'TIMESTAMP',
+        },
+    }
+
+    for table_name, columns in required_columns.items():
+        if table_name not in table_names:
+            continue
+
+        existing_columns = columns_by_table.get(table_name, set())
+        for column_name, sql_type in columns.items():
+            if column_name in existing_columns:
+                continue
+            db.session.execute(
+                db.text(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {sql_type}')
+            )
+
+    db.session.commit()
+
+def serialize_datetime(value):
+    return value.isoformat() if value else None
+
+def parse_datetime_value(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    normalized = text.replace('Z', '+00:00')
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+def normalize_promo_code(code):
+    return ''.join(str(code or '').split()).upper()
+
+def normalize_category_name(category):
+    return str(category or '').strip().lower()
+
+def now_utc():
+    return datetime.utcnow()
+
+def parse_int(value, default=None):
+    if value in (None, '', False):
+        return default
+    return int(value)
+
+def parse_float(value, default=0):
+    if value in (None, '', False):
+        return default
+    return float(value)
+
+def generate_random_promo_code(prefix='QK', length=8):
+    seed = uuid.uuid4().hex.upper()
+    core = seed[:max(length, 4)]
+    normalized_prefix = normalize_promo_code(prefix)[:8]
+    return f"{normalized_prefix}{core}" if normalized_prefix else core
+
+def promo_is_active(promo, current_time=None):
+    current_time = current_time or now_utc()
+    if not promo or promo.status != 'active':
+        return False
+    if promo.starts_at and promo.starts_at > current_time:
+        return False
+    if promo.expires and promo.expires < current_time:
+        return False
+    return True
+
 def calculate_prices(base_price_usd):
     exchange_rates = {
         'KES': 128.5,
@@ -335,6 +499,26 @@ def build_admin_auth_response(user):
         'user': build_admin_user_payload(user)
     })
 
+def get_current_user():
+    user_id = get_jwt_identity()
+    if user_id is None:
+        return None
+    return User.query.get(int(user_id))
+
+def admin_required():
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            verify_jwt_in_request()
+            user = get_current_user()
+
+            if not user or user.role not in ['admin', 'super_admin'] or user.status != 'active':
+                return jsonify({'error': 'Admin access required'}), 403
+
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
 def verify_google_credential(credential):
     if not credential:
         raise ValueError('Google credential is required')
@@ -442,6 +626,424 @@ def get_or_create_google_customer_user(profile):
     db.session.commit()
     return user, True
 
+def get_optional_current_user():
+    try:
+        verify_jwt_in_request(optional=True)
+    except Exception:
+        return None
+    return get_current_user()
+
+def build_order_item_payload(product, quantity):
+    unit_price_usd = float(product.base_price_usd or 0)
+    product_prices = product.prices or {}
+    kes_entry = product_prices.get('KES') if isinstance(product_prices, dict) else None
+    unit_price_kes = None
+    if isinstance(kes_entry, dict):
+        kes_amount = kes_entry.get('amount')
+        if kes_amount is not None:
+            unit_price_kes = float(kes_amount)
+    if unit_price_kes is None:
+        unit_price_kes = convert_usd_to_kes(unit_price_usd)
+
+    quantity = int(quantity or 0)
+
+    return {
+        'product_id': str(product.id),
+        'product_name': product.name,
+        'product_price': unit_price_usd,
+        'price_per_item': unit_price_usd,
+        'product_price_kes': unit_price_kes,
+        'price_per_item_kes': unit_price_kes,
+        'description': product.description or '',
+        'image_url': product.image_url,
+        'category': product.category or '',
+        'quantity': quantity,
+        'item_total': round(unit_price_usd * quantity, 2),
+        'item_total_kes': round(unit_price_kes * quantity, 2),
+    }
+
+def build_cart_item_payload(item):
+    return build_order_item_payload(item.product, item.quantity)
+
+def clear_user_cart_items(user_id):
+    CartItem.query.filter_by(user_id=user_id).delete()
+
+def get_promotion_product_ids(promo):
+    return {int(link.product_id) for link in promo.product_links or []}
+
+def get_promotion_categories(promo):
+    return {
+        normalize_category_name(link.category)
+        for link in promo.category_links or []
+        if normalize_category_name(link.category)
+    }
+
+def get_promotion_user_ids(promo):
+    return {int(link.user_id) for link in promo.user_links or []}
+
+def get_effective_order_count(user_id):
+    if not user_id:
+        return 0
+    return Order.query.filter(
+        Order.user_id == user_id,
+        Order.order_status != 'payment_failed'
+    ).count()
+
+def get_promo_usage_count_for_user(promo_id, user_id):
+    if not promo_id or not user_id:
+        return 0
+    return PromotionUsage.query.filter_by(promo_code_id=promo_id, user_id=user_id).count()
+
+def build_promotion_payload(promo, include_stats=False):
+    usage_stats = build_promotion_stats(promo) if include_stats else {}
+    product_ids = sorted(get_promotion_product_ids(promo))
+    categories = sorted(get_promotion_categories(promo))
+    user_ids = sorted(get_promotion_user_ids(promo))
+    usage_limit = int(promo.limit or 0) if promo.limit is not None else None
+    used_count = int(promo.uses or 0)
+
+    payload = {
+        '_id': str(promo.id),
+        'id': str(promo.id),
+        'code': promo.code,
+        'description': promo.description or '',
+        'internal_notes': promo.internal_notes or '',
+        'discount': float(promo.discount or 0),
+        'discount_value': float(promo.discount or 0),
+        'type': promo.type,
+        'discount_type': promo.type,
+        'status': promo.status,
+        'is_active': promo.status == 'active',
+        'uses': used_count,
+        'used_count': used_count,
+        'limit': usage_limit,
+        'usage_limit': usage_limit,
+        'remaining_uses': max(usage_limit - used_count, 0) if usage_limit is not None else None,
+        'per_user_limit': promo.per_user_limit,
+        'min_order_amount': float(promo.min_order_amount or 0),
+        'max_discount_amount': float(promo.max_discount_amount or 0) if promo.max_discount_amount is not None else None,
+        'first_order_only': bool(promo.first_order_only),
+        'starts_at': serialize_datetime(promo.starts_at),
+        'expires': serialize_datetime(promo.expires),
+        'applies_to_type': promo.applies_to_type or 'all',
+        'customer_scope': promo.customer_scope or 'all',
+        'campaign_type': promo.campaign_type or '',
+        'product_ids': product_ids,
+        'categories': categories,
+        'user_ids': user_ids,
+        'created_by_admin_id': str(promo.created_by_admin_id) if promo.created_by_admin_id else None,
+        'created_at': serialize_datetime(promo.created_at),
+        'updated_at': serialize_datetime(promo.updated_at),
+    }
+
+    payload.update(usage_stats)
+    return payload
+
+def build_promotion_usage_payload(usage):
+    order = usage.order
+    return {
+        '_id': str(usage.id),
+        'user_id': str(usage.user_id),
+        'order_id': str(usage.order_id),
+        'order_reference': order.order_id if order else None,
+        'discount_amount': float(usage.discount_amount or 0),
+        'shipping_discount': float(usage.shipping_discount or 0),
+        'subtotal_kes': float(usage.subtotal_kes or 0),
+        'final_total_kes': float(usage.final_total_kes or 0),
+        'used_at': serialize_datetime(usage.used_at),
+    }
+
+def build_promotion_stats(promo):
+    usages = PromotionUsage.query.filter_by(promo_code_id=promo.id).all()
+    total_discount_given = sum(float(usage.discount_amount or 0) + float(usage.shipping_discount or 0) for usage in usages)
+    revenue_influenced = sum(float(usage.final_total_kes or 0) for usage in usages)
+    orders_using_code = [build_promotion_usage_payload(usage) for usage in sorted(usages, key=lambda entry: entry.used_at or datetime.min, reverse=True)]
+
+    return {
+        'total_uses': len(usages),
+        'total_discount_given': round(total_discount_given, 2),
+        'revenue_influenced': round(revenue_influenced, 2),
+        'orders_using_code': orders_using_code,
+    }
+
+def validate_promotion_payload(data):
+    code = normalize_promo_code(data.get('code'))
+    if not code:
+        raise ValueError('Promo code is required')
+
+    discount_type = str(data.get('discount_type') or data.get('type') or 'percentage').strip().lower()
+    if discount_type not in ['percentage', 'fixed', 'free_shipping']:
+        raise ValueError('Discount type must be percentage, fixed, or free_shipping')
+
+    discount_value = parse_float(data.get('discount_value', data.get('discount', 0)), 0)
+    if discount_type != 'free_shipping' and discount_value <= 0:
+        raise ValueError('Discount value must be greater than zero')
+
+    min_order_amount = parse_float(data.get('min_order_amount'), 0)
+    max_discount_amount = data.get('max_discount_amount')
+    max_discount_amount = parse_float(max_discount_amount, None) if max_discount_amount not in (None, '') else None
+    usage_limit = parse_int(data.get('usage_limit', data.get('limit')), None)
+    per_user_limit = parse_int(data.get('per_user_limit'), None)
+    applies_to_type = str(data.get('applies_to_type') or 'all').strip().lower()
+    if applies_to_type not in ['all', 'products', 'categories']:
+        raise ValueError('Applies-to type must be all, products, or categories')
+
+    customer_scope = str(data.get('customer_scope') or 'all').strip().lower()
+    if customer_scope not in ['all', 'selected_users']:
+        raise ValueError('Customer scope must be all or selected_users')
+
+    starts_at = parse_datetime_value(data.get('starts_at'))
+    expires = parse_datetime_value(data.get('expires'))
+    if starts_at and expires and expires <= starts_at:
+        raise ValueError('Expiry date must be after the start date')
+
+    if discount_type == 'percentage' and discount_value > 100:
+        raise ValueError('Percentage discounts cannot exceed 100')
+
+    product_ids = sorted({int(product_id) for product_id in (data.get('product_ids') or []) if str(product_id).strip()})
+    categories = sorted({normalize_category_name(category) for category in (data.get('categories') or []) if normalize_category_name(category)})
+    user_ids = sorted({int(user_id) for user_id in (data.get('user_ids') or []) if str(user_id).strip()})
+
+    if applies_to_type == 'products' and not product_ids:
+        raise ValueError('Select at least one product for product-specific promotions')
+    if applies_to_type == 'categories' and not categories:
+        raise ValueError('Select at least one category for category-specific promotions')
+    if customer_scope == 'selected_users' and not user_ids:
+        raise ValueError('Select at least one user for targeted promotions')
+
+    return {
+        'code': code,
+        'description': str(data.get('description') or '').strip(),
+        'internal_notes': str(data.get('internal_notes') or '').strip(),
+        'discount': discount_value,
+        'type': discount_type,
+        'status': 'active' if bool(data.get('is_active', data.get('status', 'active') == 'active')) else 'inactive',
+        'limit': usage_limit,
+        'per_user_limit': per_user_limit,
+        'min_order_amount': min_order_amount,
+        'max_discount_amount': max_discount_amount,
+        'first_order_only': bool(data.get('first_order_only')),
+        'starts_at': starts_at,
+        'expires': expires,
+        'applies_to_type': applies_to_type,
+        'customer_scope': customer_scope,
+        'campaign_type': str(data.get('campaign_type') or '').strip(),
+        'product_ids': product_ids,
+        'categories': categories,
+        'user_ids': user_ids,
+    }
+
+def sync_promotion_targets(promo, payload):
+    PromotionProduct.query.filter_by(promo_code_id=promo.id).delete()
+    PromotionCategory.query.filter_by(promo_code_id=promo.id).delete()
+    PromotionUser.query.filter_by(promo_code_id=promo.id).delete()
+
+    for product_id in payload['product_ids']:
+        db.session.add(PromotionProduct(promo_code_id=promo.id, product_id=product_id))
+
+    for category in payload['categories']:
+        db.session.add(PromotionCategory(promo_code_id=promo.id, category=category))
+
+    for user_id in payload['user_ids']:
+        db.session.add(PromotionUser(promo_code_id=promo.id, user_id=user_id))
+
+def apply_promotion_model_updates(promo, payload, admin_user_id=None):
+    promo.code = payload['code']
+    promo.description = payload['description']
+    promo.internal_notes = payload['internal_notes']
+    promo.discount = payload['discount']
+    promo.type = payload['type']
+    promo.status = payload['status']
+    promo.limit = payload['limit']
+    promo.per_user_limit = payload['per_user_limit']
+    promo.min_order_amount = payload['min_order_amount']
+    promo.max_discount_amount = payload['max_discount_amount']
+    promo.first_order_only = payload['first_order_only']
+    promo.starts_at = payload['starts_at']
+    promo.expires = payload['expires']
+    promo.applies_to_type = payload['applies_to_type']
+    promo.customer_scope = payload['customer_scope']
+    promo.campaign_type = payload['campaign_type']
+    if admin_user_id and not promo.created_by_admin_id:
+        promo.created_by_admin_id = admin_user_id
+
+def build_checkout_items_from_payload(payload_items):
+    order_items = []
+    for raw_item in payload_items or []:
+        product_id = parse_int(raw_item.get('product_id'))
+        quantity = parse_int(raw_item.get('quantity'), 1)
+        if not product_id or quantity < 1:
+            continue
+
+        product = Product.query.get(product_id)
+        if not product:
+            raise ValueError(f'Product {product_id} no longer exists')
+        order_items.append(build_order_item_payload(product, quantity))
+
+    return order_items
+
+def resolve_order_items_for_promo_request(user, data):
+    payload_items = build_checkout_items_from_payload(data.get('items') or [])
+    if payload_items:
+        return payload_items
+
+    if user:
+        cart_items = CartItem.query.filter_by(user_id=user.id).all()
+        if cart_items:
+            return [build_cart_item_payload(item) for item in cart_items]
+
+    raise ValueError('Add items to your cart before applying a promo code')
+
+def resolve_order_items_for_checkout(user_id, data):
+    cart_items = CartItem.query.filter_by(user_id=user_id).all()
+    if cart_items:
+        return [build_cart_item_payload(item) for item in cart_items]
+
+    payload_items = build_checkout_items_from_payload(data.get('items') or [])
+    if payload_items:
+        return payload_items
+
+    raise ValueError('Cart is empty')
+
+def resolve_shipping_kes(data):
+    delivery = data.get('delivery') or {}
+    totals = data.get('totals') or {}
+    return max(parse_float(delivery.get('shipping_fee', totals.get('shipping_kes')), 0), 0)
+
+def evaluate_promotion(promo, user, order_items, shipping_kes):
+    current_time = now_utc()
+    normalized_code = promo.code if promo else ''
+    subtotal_kes = round(sum(float(item.get('item_total_kes', 0) or 0) for item in order_items), 2)
+
+    if not promo:
+        raise ValueError('Invalid promo code')
+
+    if not promo_is_active(promo, current_time=current_time):
+        raise ValueError('This promo code is inactive or outside its valid date range')
+
+    if promo.limit is not None and int(promo.uses or 0) >= int(promo.limit):
+        raise ValueError('This promo code has reached its usage limit')
+
+    if promo.customer_scope == 'selected_users':
+        if not user:
+            raise ValueError('Sign in to use this promo code')
+        if user.id not in get_promotion_user_ids(promo):
+            raise ValueError('This promo code is not available for your account')
+
+    if promo.first_order_only:
+        if not user:
+            raise ValueError('Sign in to use this first-order promo code')
+        if get_effective_order_count(user.id) > 0:
+            raise ValueError('This promo code is only available on your first order')
+
+    if promo.per_user_limit is not None:
+        if not user:
+            raise ValueError('Sign in to use this promo code')
+        if get_promo_usage_count_for_user(promo.id, user.id) >= int(promo.per_user_limit):
+            raise ValueError('You have already used this promo code the maximum number of times')
+
+    if promo.min_order_amount and subtotal_kes < float(promo.min_order_amount):
+        raise ValueError(f'This promo code requires a minimum order of KSh {float(promo.min_order_amount):,.0f}')
+
+    eligible_items = list(order_items)
+    if promo.applies_to_type == 'products':
+        target_ids = get_promotion_product_ids(promo)
+        eligible_items = [item for item in order_items if parse_int(item.get('product_id')) in target_ids]
+    elif promo.applies_to_type == 'categories':
+        target_categories = get_promotion_categories(promo)
+        eligible_items = [
+            item for item in order_items
+            if normalize_category_name(item.get('category')) in target_categories
+        ]
+
+    eligible_subtotal_kes = round(sum(float(item.get('item_total_kes', 0) or 0) for item in eligible_items), 2)
+    if promo.applies_to_type != 'all' and eligible_subtotal_kes <= 0:
+        raise ValueError('This promo code does not apply to the current cart')
+
+    discount_amount = 0
+    shipping_discount = 0
+
+    if promo.type == 'percentage':
+        discount_amount = round(eligible_subtotal_kes * (float(promo.discount or 0) / 100), 2)
+        if promo.max_discount_amount is not None:
+            discount_amount = min(discount_amount, float(promo.max_discount_amount))
+    elif promo.type == 'fixed':
+        discount_amount = min(round(float(promo.discount or 0), 2), eligible_subtotal_kes)
+    elif promo.type == 'free_shipping':
+        shipping_discount = round(max(float(shipping_kes or 0), 0), 2)
+
+    discount_amount = min(discount_amount, subtotal_kes)
+    shipping_discount = min(shipping_discount, max(float(shipping_kes or 0), 0))
+    final_total_kes = max(round(subtotal_kes + float(shipping_kes or 0) - discount_amount - shipping_discount, 2), 0)
+
+    return {
+        'promo_code_id': promo.id,
+        'promo_code': normalized_code,
+        'code': normalized_code,
+        'description': promo.description or '',
+        'campaign_type': promo.campaign_type or '',
+        'discount_type': promo.type,
+        'discount_value': float(promo.discount or 0),
+        'discount_amount': round(discount_amount, 2),
+        'shipping_discount': round(shipping_discount, 2),
+        'subtotal_kes': subtotal_kes,
+        'eligible_subtotal_kes': eligible_subtotal_kes,
+        'shipping_kes': round(float(shipping_kes or 0), 2),
+        'final_total_kes': final_total_kes,
+        'applies_to_type': promo.applies_to_type or 'all',
+        'customer_scope': promo.customer_scope or 'all',
+        'first_order_only': bool(promo.first_order_only),
+        'message': 'Promo code applied successfully',
+    }
+
+def resolve_promotion_for_checkout(user, data, order_items, shipping_kes):
+    code = normalize_promo_code(data.get('promo_code'))
+    if not code:
+        subtotal_kes = round(sum(float(item.get('item_total_kes', 0) or 0) for item in order_items), 2)
+        return {
+            'promo_code_id': None,
+            'promo_code': '',
+            'code': '',
+            'discount_type': None,
+            'discount_value': 0,
+            'discount_amount': 0,
+            'shipping_discount': 0,
+            'subtotal_kes': subtotal_kes,
+            'eligible_subtotal_kes': subtotal_kes,
+            'shipping_kes': round(float(shipping_kes or 0), 2),
+            'final_total_kes': round(subtotal_kes + float(shipping_kes or 0), 2),
+            'message': '',
+        }
+
+    promo = Promotion.query.filter_by(code=code).first()
+    return evaluate_promotion(promo, user, order_items, shipping_kes)
+
+def record_promotion_usage_for_order(order):
+    if not order or not order.promo_code_id or not order.user_id:
+        return
+
+    existing = PromotionUsage.query.filter_by(order_id=order.id).first()
+    if existing:
+        return
+
+    promo = Promotion.query.get(order.promo_code_id)
+    if not promo:
+        return
+
+    state = get_order_payment_state(order)
+    totals = state.get('totals', {}) if isinstance(state, dict) else {}
+    usage = PromotionUsage(
+        promo_code_id=promo.id,
+        user_id=order.user_id,
+        order_id=order.id,
+        discount_amount=float(order.discount_amount or totals.get('discount_amount', 0) or 0),
+        shipping_discount=float(order.shipping_discount or totals.get('shipping_discount', 0) or 0),
+        subtotal_kes=float(totals.get('subtotal_kes', 0) or 0),
+        final_total_kes=float(order.final_total_after_discount or totals.get('grand_total_kes', 0) or 0),
+    )
+    db.session.add(usage)
+    promo.uses = int(promo.uses or 0) + 1
+
 def get_order_payment_state(order):
     if not order.status_note:
         return {}
@@ -483,17 +1085,15 @@ def append_order_event(order, event_type, message, category='order', actor='syst
     order.status_note = json.dumps(state)
     return state
 
-def build_order_summary_payload(data, user, order_items, total_usd):
-    totals = data.get('totals') or {}
+def build_order_summary_payload(data, user, order_items, total_usd, promo_summary):
     payment_details = data.get('payment_details') or {}
     delivery = data.get('delivery') or {}
-    subtotal_kes = sum(
-        float(item.get('item_total_kes', 0) or 0)
-        for item in order_items
-        if item.get('item_total_kes') is not None
-    )
-    shipping_kes = float(totals.get('shipping_kes', 0) or 0)
-    grand_total_kes = float(totals.get('grand_total_kes', subtotal_kes + shipping_kes) or 0)
+    subtotal_kes = float(promo_summary.get('subtotal_kes', 0) or 0)
+    shipping_kes = float(promo_summary.get('shipping_kes', 0) or 0)
+    discount_amount = float(promo_summary.get('discount_amount', 0) or 0)
+    shipping_discount = float(promo_summary.get('shipping_discount', 0) or 0)
+    grand_total_kes = float(promo_summary.get('final_total_kes', subtotal_kes + shipping_kes) or 0)
+    discount_percent = float(promo_summary.get('discount_value', 0) or 0) if promo_summary.get('discount_type') == 'percentage' else 0
 
     return {
         'customer': {
@@ -503,12 +1103,25 @@ def build_order_summary_payload(data, user, order_items, total_usd):
             'phone': (data.get('shipping_address') or {}).get('phone') or (user.phone if user else None),
         },
         'totals': {
-            'currency': totals.get('currency', 'KES'),
+            'currency': 'KES',
             'subtotal_kes': subtotal_kes,
             'shipping_kes': shipping_kes,
-            'discount_percent': float(totals.get('discount_percent', 0) or 0),
+            'discount_percent': discount_percent,
+            'discount_amount': discount_amount,
+            'shipping_discount': shipping_discount,
+            'total_discount': round(discount_amount + shipping_discount, 2),
             'grand_total_kes': grand_total_kes,
             'total_usd': total_usd,
+        },
+        'promo': {
+            'promo_code_id': promo_summary.get('promo_code_id'),
+            'promo_code': promo_summary.get('promo_code'),
+            'discount_type': promo_summary.get('discount_type'),
+            'discount_value': promo_summary.get('discount_value'),
+            'discount_amount': discount_amount,
+            'shipping_discount': shipping_discount,
+            'campaign_type': promo_summary.get('campaign_type'),
+            'description': promo_summary.get('description'),
         },
         'payment_details': payment_details,
         'delivery': delivery,
@@ -549,6 +1162,9 @@ def resolve_order_totals_kes(order, state, items):
 
     if subtotal_kes <= 0:
         subtotal_kes = items_subtotal_kes
+
+    if grand_total_kes <= 0 and order.final_total_after_discount:
+        grand_total_kes = float(order.final_total_after_discount or 0)
 
     if grand_total_kes <= 0:
         if amount_kes > 0:
@@ -592,6 +1208,7 @@ def build_admin_order_payload(order):
     customer = state.get('customer', {}) if isinstance(state, dict) else {}
     payment_details = state.get('payment_details', {}) if isinstance(state, dict) else {}
     delivery = state.get('delivery', {}) if isinstance(state, dict) else {}
+    promo = state.get('promo', {}) if isinstance(state, dict) else {}
     receipt_number = state.get('receipt_number')
     events = list(state.get('events') or [])
     items = normalize_order_items_for_admin(order.items or [])
@@ -626,6 +1243,13 @@ def build_admin_order_payload(order):
         'shipping_kes': shipping_kes,
         'grand_total_kes': grand_total_kes,
         'discount_percent': float((state.get('totals') or {}).get('discount_percent', 0) or 0),
+        'promo_code_id': str(order.promo_code_id) if order.promo_code_id else promo.get('promo_code_id'),
+        'promo_code': order.promo_code or promo.get('promo_code'),
+        'discount_type': order.discount_type or promo.get('discount_type'),
+        'discount_amount': float(order.discount_amount or (state.get('totals') or {}).get('discount_amount', 0) or 0),
+        'shipping_discount': float(order.shipping_discount or (state.get('totals') or {}).get('shipping_discount', 0) or 0),
+        'final_total_after_discount': float(order.final_total_after_discount or grand_total_kes),
+        'promo': promo,
         'total_usd': order.total_usd,
         'created_at': order.created_at.isoformat(),
         'updated_at': order.updated_at.isoformat() if order.updated_at else None,
@@ -843,6 +1467,98 @@ def seed_data():
         db.session.add(admin)
         db.session.commit()
         print("✅ Created admin user: admin@queenkoba.com / admin123")
+
+    admin_user = User.query.filter_by(email='admin@queenkoba.com').first()
+    seeded_promotions = [
+        {
+            'code': 'WELCOME10',
+            'description': '10% off for first-time Queen Koba customers',
+            'internal_notes': 'Welcome journey code',
+            'discount': 10,
+            'type': 'percentage',
+            'status': 'active',
+            'limit': 1000,
+            'per_user_limit': 1,
+            'min_order_amount': 1500,
+            'max_discount_amount': 1000,
+            'first_order_only': True,
+            'starts_at': now_utc() - timedelta(days=1),
+            'expires': now_utc() + timedelta(days=180),
+            'applies_to_type': 'all',
+            'customer_scope': 'all',
+            'campaign_type': 'welcome',
+        },
+        {
+            'code': 'FREEDELIVERY',
+            'description': 'Free shipping across Kenya for limited-time campaigns',
+            'internal_notes': 'Shipping incentive code',
+            'discount': 0,
+            'type': 'free_shipping',
+            'status': 'active',
+            'limit': 500,
+            'per_user_limit': 3,
+            'min_order_amount': 2500,
+            'max_discount_amount': None,
+            'first_order_only': False,
+            'starts_at': now_utc() - timedelta(days=1),
+            'expires': now_utc() + timedelta(days=90),
+            'applies_to_type': 'all',
+            'customer_scope': 'all',
+            'campaign_type': 'cart_recovery',
+        },
+        {
+            'code': 'MELANIN15',
+            'description': '15% off selected glow essentials',
+            'internal_notes': 'Category-focused seasonal boost',
+            'discount': 15,
+            'type': 'percentage',
+            'status': 'active',
+            'limit': 300,
+            'per_user_limit': 2,
+            'min_order_amount': 2000,
+            'max_discount_amount': 1500,
+            'first_order_only': False,
+            'starts_at': now_utc() - timedelta(days=1),
+            'expires': now_utc() + timedelta(days=120),
+            'applies_to_type': 'categories',
+            'customer_scope': 'all',
+            'campaign_type': 'holiday_sale',
+            'categories': ['serum', 'cream'],
+        },
+    ]
+
+    for seeded in seeded_promotions:
+        promo = Promotion.query.filter_by(code=seeded['code']).first()
+        payload = {
+            'code': seeded['code'],
+            'description': seeded['description'],
+            'internal_notes': seeded['internal_notes'],
+            'discount_value': seeded['discount'],
+            'discount_type': seeded['type'],
+            'is_active': seeded['status'] == 'active',
+            'usage_limit': seeded['limit'],
+            'per_user_limit': seeded['per_user_limit'],
+            'min_order_amount': seeded['min_order_amount'],
+            'max_discount_amount': seeded['max_discount_amount'],
+            'first_order_only': seeded['first_order_only'],
+            'starts_at': seeded['starts_at'],
+            'expires': seeded['expires'],
+            'applies_to_type': seeded.get('applies_to_type', 'all'),
+            'customer_scope': seeded.get('customer_scope', 'all'),
+            'campaign_type': seeded.get('campaign_type', ''),
+            'categories': seeded.get('categories', []),
+            'product_ids': seeded.get('product_ids', []),
+            'user_ids': seeded.get('user_ids', []),
+        }
+        validated = validate_promotion_payload(payload)
+        if not promo:
+            promo = Promotion(created_by_admin_id=admin_user.id if admin_user else None)
+            db.session.add(promo)
+            db.session.flush()
+        apply_promotion_model_updates(promo, validated, admin_user_id=admin_user.id if admin_user else None)
+        sync_promotion_targets(promo, validated)
+
+    db.session.commit()
 
 # ========== ROUTES ==========
 @app.route('/')
@@ -1101,17 +1817,14 @@ def get_cart():
     user_id = int(get_jwt_identity())
     cart_items = CartItem.query.filter_by(user_id=user_id).all()
     
-    total_usd = sum(item.product.base_price_usd * item.quantity for item in cart_items)
+    cart_payload = [build_cart_item_payload(item) for item in cart_items]
+    total_usd = sum(item['item_total'] for item in cart_payload)
+    total_kes = sum(item['item_total_kes'] for item in cart_payload)
     
     return jsonify({
         'status': 'success',
-        'cart': [{
-            'product_id': str(item.product_id),
-            'product_name': item.product.name,
-            'product_price': item.product.base_price_usd,
-            'quantity': item.quantity
-        } for item in cart_items],
-        'total': {'usd': round(total_usd, 2)}
+        'cart': cart_payload,
+        'total': {'usd': round(total_usd, 2), 'kes': round(total_kes, 2)}
     })
 
 @app.route('/cart/add', methods=['POST'])
@@ -1137,6 +1850,25 @@ def add_to_cart():
     
     return jsonify({'status': 'success', 'message': 'Product added to cart'})
 
+@app.route('/cart/update/<int:product_id>', methods=['PUT'])
+@jwt_required()
+def update_cart_item(product_id):
+    user_id = int(get_jwt_identity())
+    data = request.get_json() or {}
+    quantity = int(data.get('quantity', 1) or 1)
+
+    item = CartItem.query.filter_by(user_id=user_id, product_id=product_id).first()
+    if not item:
+        return jsonify({'error': 'Product not in cart'}), 404
+
+    if quantity <= 0:
+        db.session.delete(item)
+    else:
+        item.quantity = quantity
+
+    db.session.commit()
+    return jsonify({'status': 'success', 'message': 'Cart updated'})
+
 @app.route('/cart/remove/<int:product_id>', methods=['DELETE'])
 @jwt_required()
 def remove_from_cart(product_id):
@@ -1150,6 +1882,14 @@ def remove_from_cart(product_id):
     db.session.commit()
     return jsonify({'status': 'success', 'message': 'Product removed from cart'})
 
+@app.route('/cart/clear', methods=['DELETE'])
+@jwt_required()
+def clear_cart():
+    user_id = int(get_jwt_identity())
+    clear_user_cart_items(user_id)
+    db.session.commit()
+    return jsonify({'status': 'success', 'message': 'Cart cleared'})
+
 @app.route('/checkout', methods=['POST'])
 @jwt_required()
 def checkout():
@@ -1157,46 +1897,19 @@ def checkout():
     data = request.get_json() or {}
     user = User.query.get(user_id)
     
-    cart_items = CartItem.query.filter_by(user_id=user_id).all()
-    total_usd = 0
-    order_items = []
+    try:
+        order_items = resolve_order_items_for_checkout(user_id, data)
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
 
-    if cart_items:
-        for item in cart_items:
-            item_total = item.product.base_price_usd * item.quantity
-            total_usd += item_total
-            order_items.append({
-                'product_id': str(item.product_id),
-                'product_name': item.product.name,
-                'quantity': item.quantity,
-                'price_per_item': item.product.base_price_usd,
-                'item_total': item_total
-            })
-    else:
-        payload_items = data.get('items') or []
-        totals = data.get('totals') or {}
+    shipping_kes = resolve_shipping_kes(data)
 
-        if not payload_items:
-            return jsonify({'message': 'Cart is empty'}), 400
+    try:
+        promo_summary = resolve_promotion_for_checkout(user, data, order_items, shipping_kes)
+    except ValueError as error:
+        return jsonify({'message': str(error)}), 400
 
-        currency = totals.get('currency', 'KES')
-        grand_total = float(totals.get('grand_total_kes', 0) or 0)
-        if currency == 'KES' and grand_total > 0:
-            total_usd = round(grand_total / 128.5, 2)
-        else:
-            total_usd = round(float(totals.get('grand_total', 0) or 0), 2)
-
-        for item in payload_items:
-            quantity = int(item.get('quantity', 1) or 1)
-            price_per_item_kes = float(item.get('price_per_item_kes', 0) or 0)
-            item_total_kes = float(item.get('item_total_kes', price_per_item_kes * quantity) or 0)
-            order_items.append({
-                'product_id': str(item.get('product_id', 'local')),
-                'product_name': item.get('product_name', 'Queen Koba Product'),
-                'quantity': quantity,
-                'price_per_item_kes': price_per_item_kes,
-                'item_total_kes': item_total_kes,
-            })
+    total_usd = round(float(promo_summary.get('final_total_kes', 0) or 0) / 128.5, 2)
 
     payment_method = data.get('payment_method', 'card')
     order = Order(
@@ -1207,20 +1920,26 @@ def checkout():
         shipping_address=data.get('shipping_address', {}),
         payment_method=payment_method,
         payment_status='pending',
-        order_status='processing'
+        order_status='processing',
+        promo_code_id=promo_summary.get('promo_code_id'),
+        promo_code=promo_summary.get('promo_code'),
+        discount_type=promo_summary.get('discount_type'),
+        discount_amount=float(promo_summary.get('discount_amount', 0) or 0),
+        shipping_discount=float(promo_summary.get('shipping_discount', 0) or 0),
+        final_total_after_discount=float(promo_summary.get('final_total_kes', 0) or 0),
     )
 
     db.session.add(order)
     db.session.flush()
     set_order_payment_state(
         order,
-        **build_order_summary_payload(data, user, order_items, total_usd),
+        **build_order_summary_payload(data, user, order_items, total_usd, promo_summary),
     )
     append_order_event(
         order,
         event_type='order_created',
         category='order',
-        message=f"Order created with {len(order_items)} item(s) totaling KSh {float((data.get('totals') or {}).get('grand_total_kes', 0) or 0):,.0f}.",
+        message=f"Order created with {len(order_items)} item(s) totaling KSh {float(promo_summary.get('final_total_kes', 0) or 0):,.0f}.",
         metadata={
             'payment_method': payment_method,
             'item_count': len(order_items),
@@ -1228,8 +1947,7 @@ def checkout():
     )
 
     if payment_method == 'mpesa':
-        totals = data.get('totals') or {}
-        grand_total_kes = float(totals.get('grand_total_kes', 0) or 0)
+        grand_total_kes = float(promo_summary.get('final_total_kes', 0) or 0)
         payment_details = data.get('payment_details') or {}
         phone_number = payment_details.get('phone_number')
 
@@ -1300,7 +2018,8 @@ def checkout():
             }
         })
 
-    CartItem.query.filter_by(user_id=user_id).delete()
+    clear_user_cart_items(user_id)
+    record_promotion_usage_for_order(order)
     append_order_event(
         order,
         event_type='payment_recorded',
@@ -1313,7 +2032,8 @@ def checkout():
     return jsonify({
         'status': 'success',
         'order_id': order.order_id,
-        'total': total_usd
+        'total': total_usd,
+        'promo': promo_summary,
     })
 
 @app.route('/payments/mpesa/callback', methods=['POST'])
@@ -1354,6 +2074,9 @@ def mpesa_callback():
                 'receipt_number': metadata.get('MpesaReceiptNumber'),
             },
         )
+        if result_code == 0:
+            clear_user_cart_items(order.user_id)
+            record_promotion_usage_for_order(order)
         db.session.commit()
 
     return jsonify({'ResultCode': 0, 'ResultDesc': 'Accepted'})
@@ -1406,6 +2129,8 @@ def mpesa_status(order_ref):
     if result_code == 0:
         order.payment_status = 'paid'
         order.order_status = 'processing'
+        clear_user_cart_items(user_id)
+        record_promotion_usage_for_order(order)
     elif result_code in [1032, 1037, 2001, 1]:
         order.payment_status = 'failed'
         order.order_status = 'payment_failed'
@@ -1445,14 +2170,7 @@ def get_orders():
     
     return jsonify({
         'status': 'success',
-        'orders': [{
-            '_id': str(o.id),
-            'order_id': o.order_id,
-            'items': o.items,
-            'total_usd': o.total_usd,
-            'order_status': o.order_status,
-            'created_at': o.created_at.isoformat()
-        } for o in orders]
+        'orders': [build_admin_order_payload(o) for o in orders]
     })
 
 @app.route('/orders/<int:order_id>', methods=['GET'])
@@ -1465,18 +2183,7 @@ def get_order(order_id):
 
     return jsonify({
         'status': 'success',
-        'order': {
-            '_id': str(order.id),
-            'order_id': order.order_id,
-            'items': order.items,
-            'total_usd': order.total_usd,
-            'shipping_address': order.shipping_address,
-            'payment_method': order.payment_method,
-            'payment_status': order.payment_status,
-            'order_status': order.order_status,
-            'created_at': order.created_at.isoformat(),
-            'updated_at': order.updated_at.isoformat() if order.updated_at else None,
-        }
+        'order': build_admin_order_payload(order)
     })
 
 @app.route('/admin/auth/login', methods=['POST'])
@@ -1495,7 +2202,7 @@ def admin_login():
     return build_admin_auth_response(user)
 
 @app.route('/admin/dashboard/kpis', methods=['GET'])
-@jwt_required()
+@admin_required()
 def get_dashboard_kpis():
     now = datetime.utcnow()
     thirty_days_ago = now - timedelta(days=30)
@@ -1553,7 +2260,7 @@ def get_dashboard_kpis():
     })
 
 @app.route('/admin/products', methods=['GET', 'POST'])
-@jwt_required()
+@admin_required()
 def admin_products():
     if request.method == 'GET':
         products = Product.query.all()
@@ -1599,7 +2306,7 @@ def admin_products():
         return jsonify({'status': 'success', 'product': {'_id': str(product.id)}}), 201
 
 @app.route('/admin/products/<int:product_id>', methods=['PUT', 'DELETE'])
-@jwt_required()
+@admin_required()
 def admin_product(product_id):
     product = Product.query.get_or_404(product_id)
     
@@ -1626,7 +2333,7 @@ def admin_product(product_id):
         return jsonify({'status': 'success'})
 
 @app.route('/admin/orders', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_orders():
     orders = Order.query.order_by(Order.created_at.desc()).limit(50).all()
     return jsonify({
@@ -1634,7 +2341,7 @@ def admin_get_orders():
     })
 
 @app.route('/admin/orders/<int:order_id>/status', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_update_order_status(order_id):
     order = Order.query.get_or_404(order_id)
     data = request.get_json() or {}
@@ -1659,7 +2366,7 @@ def admin_update_order_status(order_id):
     return jsonify({'status': 'success', 'message': 'Order status updated'})
 
 @app.route('/admin/customers', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_customers():
     customers = User.query.filter_by(role='customer').limit(50).all()
 
@@ -1698,7 +2405,7 @@ def admin_get_customers():
     })
 
 @app.route('/admin/profile/password', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_change_password():
     user_id = int(get_jwt_identity())
     data = request.get_json()
@@ -1714,7 +2421,7 @@ def admin_change_password():
     return jsonify({'status': 'success', 'message': 'Password updated successfully'})
 
 @app.route('/admin/reviews', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_reviews():
     reviews = Review.query.order_by(Review.created_at.desc()).all()
     return jsonify({
@@ -1732,7 +2439,7 @@ def admin_get_reviews():
     })
 
 @app.route('/admin/reviews/<int:review_id>/approve', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_approve_review(review_id):
     review = Review.query.get_or_404(review_id)
     review.status = 'approved'
@@ -1740,7 +2447,7 @@ def admin_approve_review(review_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/reviews/<int:review_id>/reject', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_reject_review(review_id):
     review = Review.query.get_or_404(review_id)
     review.status = 'rejected'
@@ -1748,7 +2455,7 @@ def admin_reject_review(review_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/reviews/<int:review_id>', methods=['DELETE'])
-@jwt_required()
+@admin_required()
 def admin_delete_review(review_id):
     review = Review.query.get_or_404(review_id)
     db.session.delete(review)
@@ -1778,37 +2485,62 @@ def get_payment_methods(country):
 
 @app.route('/promotions/active', methods=['GET'])
 def get_active_promotions():
-    promotions = Promotion.query.filter_by(status='active').all()
+    promotions = [
+        promo for promo in Promotion.query.filter_by(status='active').all()
+        if promo_is_active(promo)
+    ]
     return jsonify({
-        'promotions': [{
-            '_id': str(p.id),
-            'code': p.code,
-            'discount': p.discount,
-            'type': p.type,
-            'expires': p.expires.isoformat() if p.expires else None
-        } for p in promotions]
+        'promotions': [build_promotion_payload(promo) for promo in promotions]
     })
 
 @app.route('/promotions/validate', methods=['POST'])
 def validate_promo_code():
-    data = request.get_json()
-    code = data.get('code', '').upper()
-    
-    promo = Promotion.query.filter_by(code=code, status='active').first()
-    
-    if not promo:
-        return jsonify({'error': 'Invalid promo code'}), 404
-    
-    if promo.expires and promo.expires < datetime.utcnow():
-        return jsonify({'error': 'Promo code expired'}), 400
-    
-    if promo.limit and promo.uses >= promo.limit:
-        return jsonify({'error': 'Promo code limit reached'}), 400
-    
+    data = request.get_json() or {}
+    code = normalize_promo_code(data.get('code'))
+    if not code:
+        return jsonify({'error': 'Promo code is required'}), 400
+
+    user = get_optional_current_user()
+
+    try:
+        order_items = resolve_order_items_for_promo_request(user, data)
+        shipping_kes = resolve_shipping_kes(data)
+        promo = Promotion.query.filter_by(code=code).first()
+        summary = evaluate_promotion(promo, user, order_items, shipping_kes)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
     return jsonify({
-        'code': promo.code,
-        'discount': promo.discount,
-        'type': promo.type
+        'status': 'success',
+        'promo': summary,
+    })
+
+@app.route('/cart/apply-promocode', methods=['POST'])
+def apply_cart_promo_code():
+    data = request.get_json() or {}
+    data['code'] = normalize_promo_code(data.get('code'))
+    if not data.get('code'):
+        return jsonify({'error': 'Promo code is required'}), 400
+
+    user = get_optional_current_user()
+    try:
+        order_items = resolve_order_items_for_promo_request(user, data)
+        shipping_kes = resolve_shipping_kes(data)
+        promo = Promotion.query.filter_by(code=data['code']).first()
+        summary = evaluate_promotion(promo, user, order_items, shipping_kes)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+    return jsonify({
+        'status': 'success',
+        'promo': summary,
+    })
+
+@app.route('/cart/remove-promocode', methods=['DELETE'])
+def remove_cart_promo_code():
+    return jsonify({
+        'status': 'success',
+        'message': 'Promo code removed',
     })
 
 @app.route('/support-tickets', methods=['POST'])
@@ -1829,7 +2561,7 @@ def create_support_ticket():
     }), 201
 
 @app.route('/admin/support-tickets', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_support_tickets():
     tickets = SupportTicket.query.order_by(SupportTicket.created_at.desc()).all()
     return jsonify({
@@ -1846,7 +2578,7 @@ def admin_get_support_tickets():
     })
 
 @app.route('/admin/support-tickets/<int:ticket_id>', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_support_ticket(ticket_id):
     ticket = SupportTicket.query.get_or_404(ticket_id)
     return jsonify({
@@ -1864,7 +2596,7 @@ def admin_get_support_ticket(ticket_id):
     })
 
 @app.route('/admin/support-tickets/<int:ticket_id>/status', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_update_support_ticket_status(ticket_id):
     ticket = SupportTicket.query.get_or_404(ticket_id)
     data = request.get_json() or {}
@@ -1873,7 +2605,7 @@ def admin_update_support_ticket_status(ticket_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/support-tickets/<int:ticket_id>/reply', methods=['POST'])
-@jwt_required()
+@admin_required()
 def admin_reply_support_ticket(ticket_id):
     ticket = SupportTicket.query.get_or_404(ticket_id)
     data = request.get_json() or {}
@@ -1888,55 +2620,158 @@ def admin_reply_support_ticket(ticket_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/promotions', methods=['GET', 'POST'])
-@jwt_required()
+@admin_required()
 def admin_promotions():
     if request.method == 'GET':
-        promotions = Promotion.query.all()
-        return jsonify({
-            'promotions': [{
-                '_id': str(p.id),
-                'code': p.code,
-                'discount': p.discount,
-                'type': p.type,
-                'status': p.status,
-                'uses': p.uses,
-                'limit': p.limit,
-                'expires': p.expires.isoformat() if p.expires else None
-            } for p in promotions]
-        })
-    else:
-        data = request.get_json()
-        promo = Promotion(
-            code=data.get('code', '').upper(),
-            discount=data.get('discount', 0),
-            type=data.get('type', 'percentage'),
-            status='active',
-            limit=data.get('limit'),
-            expires=data.get('expires')
-        )
-        db.session.add(promo)
-        db.session.commit()
-        return jsonify({'status': 'success'}), 201
+        promotions = Promotion.query.order_by(Promotion.created_at.desc()).all()
+        search = str(request.args.get('search') or '').strip().lower()
+        status_filter = str(request.args.get('status') or '').strip().lower()
+        discount_type_filter = str(request.args.get('discount_type') or '').strip().lower()
+        campaign_filter = str(request.args.get('campaign_type') or '').strip().lower()
 
-@app.route('/admin/promotions/<int:promo_id>', methods=['DELETE'])
-@jwt_required()
-def admin_delete_promotion(promo_id):
-    promo = Promotion.query.get_or_404(promo_id)
-    db.session.delete(promo)
+        if search:
+            promotions = [
+                promo for promo in promotions
+                if search in (promo.code or '').lower() or search in (promo.description or '').lower()
+            ]
+        if status_filter:
+            promotions = [promo for promo in promotions if (promo.status or '').lower() == status_filter]
+        if discount_type_filter:
+            promotions = [promo for promo in promotions if (promo.type or '').lower() == discount_type_filter]
+        if campaign_filter:
+            promotions = [promo for promo in promotions if (promo.campaign_type or '').lower() == campaign_filter]
+
+        return jsonify({
+            'promotions': [build_promotion_payload(promo, include_stats=True) for promo in promotions]
+        })
+    
+    data = request.get_json() or {}
+    try:
+        payload = validate_promotion_payload(data)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+    existing = Promotion.query.filter_by(code=payload['code']).first()
+    if existing:
+        return jsonify({'error': 'A promo code with that code already exists'}), 409
+
+    promo = Promotion()
+    apply_promotion_model_updates(promo, payload, admin_user_id=int(get_jwt_identity()))
+    db.session.add(promo)
+    db.session.flush()
+    sync_promotion_targets(promo, payload)
     db.session.commit()
-    return jsonify({'status': 'success'})
+    return jsonify({'status': 'success', 'promotion': build_promotion_payload(promo, include_stats=True)}), 201
+
+@app.route('/admin/promotions/generate-random', methods=['POST'])
+@admin_required()
+def admin_generate_random_promotion_code():
+    data = request.get_json() or {}
+    prefix = data.get('prefix', 'QK')
+    attempts = 0
+    code = generate_random_promo_code(prefix=prefix, length=parse_int(data.get('length'), 8) or 8)
+    while Promotion.query.filter_by(code=code).first():
+        attempts += 1
+        code = generate_random_promo_code(prefix=prefix, length=parse_int(data.get('length'), 8) or 8)
+        if attempts > 5:
+            break
+    return jsonify({'status': 'success', 'code': code})
+
+@app.route('/admin/promotions/<int:promo_id>/stats', methods=['GET'])
+@admin_required()
+def admin_get_promotion_stats(promo_id):
+    promo = Promotion.query.get_or_404(promo_id)
+    return jsonify({
+        'status': 'success',
+        'promotion': build_promotion_payload(promo, include_stats=True),
+    })
+
+@app.route('/admin/promotions/<int:promo_id>/duplicate', methods=['POST'])
+@admin_required()
+def admin_duplicate_promotion(promo_id):
+    promo = Promotion.query.get_or_404(promo_id)
+    duplicated = Promotion()
+    duplicated_payload = build_promotion_payload(promo)
+    payload = validate_promotion_payload({
+        **duplicated_payload,
+        'code': generate_random_promo_code(prefix=promo.code[:4] or 'QK', length=8),
+        'status': 'inactive',
+        'is_active': False,
+        'product_ids': duplicated_payload.get('product_ids', []),
+        'categories': duplicated_payload.get('categories', []),
+        'user_ids': duplicated_payload.get('user_ids', []),
+    })
+    apply_promotion_model_updates(duplicated, payload, admin_user_id=int(get_jwt_identity()))
+    db.session.add(duplicated)
+    db.session.flush()
+    sync_promotion_targets(duplicated, payload)
+    db.session.commit()
+    return jsonify({
+        'status': 'success',
+        'promotion': build_promotion_payload(duplicated, include_stats=True),
+    }), 201
+
+@app.route('/admin/promotions/<int:promo_id>/toggle', methods=['PATCH'])
+@admin_required()
+def admin_toggle_promotion_status(promo_id):
+    promo = Promotion.query.get_or_404(promo_id)
+    promo.status = 'inactive' if promo.status == 'active' else 'active'
+    db.session.commit()
+    return jsonify({'status': 'success', 'promotion': build_promotion_payload(promo, include_stats=True)})
 
 @app.route('/admin/promotions/<int:promo_id>/status', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_update_promotion_status(promo_id):
     promo = Promotion.query.get_or_404(promo_id)
     data = request.get_json() or {}
-    promo.status = data.get('status', promo.status)
+    next_status = str(data.get('status') or promo.status).strip().lower()
+    if next_status not in ['active', 'inactive']:
+        return jsonify({'error': 'Status must be active or inactive'}), 400
+    promo.status = next_status
     db.session.commit()
-    return jsonify({'status': 'success'})
+    return jsonify({'status': 'success', 'promotion': build_promotion_payload(promo, include_stats=True)})
+
+@app.route('/admin/promotions/<int:promo_id>', methods=['GET', 'PUT', 'DELETE'])
+@admin_required()
+def admin_promotion_detail(promo_id):
+    promo = Promotion.query.get_or_404(promo_id)
+    if request.method == 'GET':
+        return jsonify({'promotion': build_promotion_payload(promo, include_stats=True)})
+
+    if request.method == 'DELETE':
+        if promo.uses or PromotionUsage.query.filter_by(promo_code_id=promo.id).count() > 0 or Order.query.filter_by(promo_code_id=promo.id).count() > 0:
+            promo.status = 'inactive'
+            db.session.commit()
+            return jsonify({
+                'status': 'success',
+                'message': 'Promo code has existing usage history and was deactivated instead of deleted',
+                'promotion': build_promotion_payload(promo, include_stats=True),
+            })
+
+        PromotionProduct.query.filter_by(promo_code_id=promo.id).delete()
+        PromotionCategory.query.filter_by(promo_code_id=promo.id).delete()
+        PromotionUser.query.filter_by(promo_code_id=promo.id).delete()
+        db.session.delete(promo)
+        db.session.commit()
+        return jsonify({'status': 'success'})
+
+    data = request.get_json() or {}
+    try:
+        payload = validate_promotion_payload(data)
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+
+    existing = Promotion.query.filter_by(code=payload['code']).first()
+    if existing and existing.id != promo.id:
+        return jsonify({'error': 'A promo code with that code already exists'}), 409
+
+    apply_promotion_model_updates(promo, payload, admin_user_id=int(get_jwt_identity()))
+    sync_promotion_targets(promo, payload)
+    db.session.commit()
+    return jsonify({'status': 'success', 'promotion': build_promotion_payload(promo, include_stats=True)})
 
 @app.route('/admin/payments', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_payments():
     orders = Order.query.order_by(Order.created_at.desc()).all()
     payments = []
@@ -1966,7 +2801,7 @@ def admin_get_payments():
     return jsonify({'payments': payments})
 
 @app.route('/admin/shipping-zones', methods=['GET', 'POST'])
-@jwt_required()
+@admin_required()
 def admin_shipping_zones():
     if request.method == 'GET':
         zones = ShippingZone.query.all()
@@ -1994,7 +2829,7 @@ def admin_shipping_zones():
         return jsonify({'status': 'success'}), 201
 
 @app.route('/admin/shipping-zones/<int:zone_id>', methods=['PUT', 'DELETE'])
-@jwt_required()
+@admin_required()
 def admin_shipping_zone(zone_id):
     zone = ShippingZone.query.get_or_404(zone_id)
     if request.method == 'DELETE':
@@ -2010,7 +2845,7 @@ def admin_shipping_zone(zone_id):
         return jsonify({'status': 'success'})
 
 @app.route('/admin/shipping-zones/<int:zone_id>/status', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_shipping_zone_status(zone_id):
     zone = ShippingZone.query.get_or_404(zone_id)
     data = request.get_json() or {}
@@ -2019,7 +2854,7 @@ def admin_shipping_zone_status(zone_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/content', methods=['GET', 'PUT'])
-@jwt_required()
+@admin_required()
 def admin_content():
     if request.method == 'GET':
         # Get all content from database
@@ -2062,7 +2897,7 @@ def public_content():
     return jsonify({'content': {c.key: c.value for c in all_content}})
 
 @app.route('/admin/admins', methods=['GET'])
-@jwt_required()
+@admin_required()
 def admin_get_admins():
     admins = User.query.filter(User.role.in_(['admin', 'super_admin'])).all()
     return jsonify({
@@ -2078,7 +2913,7 @@ def admin_get_admins():
     })
 
 @app.route('/admin/admins', methods=['POST'])
-@jwt_required()
+@admin_required()
 def admin_create_admin():
     data = request.get_json() or {}
     email = data.get('email')
@@ -2102,7 +2937,7 @@ def admin_create_admin():
     return jsonify({'status': 'success', 'admin': {'_id': str(admin.id)}}), 201
 
 @app.route('/admin/admins/<int:admin_id>', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_update_admin(admin_id):
     admin = User.query.get_or_404(admin_id)
     data = request.get_json() or {}
@@ -2123,7 +2958,7 @@ def admin_update_admin(admin_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/admins/<int:admin_id>/status', methods=['PUT'])
-@jwt_required()
+@admin_required()
 def admin_update_admin_status(admin_id):
     admin = User.query.get_or_404(admin_id)
     data = request.get_json() or {}
@@ -2132,7 +2967,7 @@ def admin_update_admin_status(admin_id):
     return jsonify({'status': 'success'})
 
 @app.route('/admin/admins/<int:admin_id>', methods=['DELETE'])
-@jwt_required()
+@admin_required()
 def admin_delete_admin(admin_id):
     admin = User.query.get_or_404(admin_id)
     db.session.delete(admin)
