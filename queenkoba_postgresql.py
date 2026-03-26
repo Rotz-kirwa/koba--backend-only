@@ -489,7 +489,8 @@ def build_admin_user_payload(user):
         'email': user.email,
         'full_name': user.username or user.name or 'Admin',
         'role': user.role,
-        'permissions': user.permissions or ['*']
+        'permissions': user.permissions or ['*'],
+        'status': user.status or 'active',
     }
 
 def build_admin_auth_response(user):
@@ -1127,6 +1128,119 @@ def build_order_summary_payload(data, user, order_items, total_usd, promo_summar
         'delivery': delivery,
     }
 
+def get_account_password_validation_error(password, *, min_length=8):
+    if not isinstance(password, str) or not password:
+        return 'Password is required'
+    if len(password) < min_length:
+        return f'Password must be at least {min_length} characters long'
+    if len(password) > 128:
+        return 'Password must be 128 characters or fewer'
+    if not any(char.isalpha() for char in password):
+        return 'Password must include at least one letter'
+    if not any(char.isdigit() for char in password):
+        return 'Password must include at least one number'
+    return None
+
+def is_valid_account_password(password, *, min_length=8):
+    return get_account_password_validation_error(password, min_length=min_length) is None
+
+def month_range_start(dt):
+    return datetime(dt.year, dt.month, 1)
+
+def add_months(dt, delta):
+    month_index = dt.month - 1 + delta
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    return datetime(year, month, 1)
+
+def build_admin_analytics_payload():
+    now = datetime.utcnow()
+    current_month_start = month_range_start(now)
+    start_month = add_months(current_month_start, -5)
+    next_month = add_months(current_month_start, 1)
+
+    orders = Order.query.filter(
+        Order.created_at >= start_month,
+        Order.created_at < next_month,
+    ).order_by(Order.created_at.asc()).all()
+
+    revenue_by_month = {}
+    orders_by_month = {}
+    paid_orders = []
+    product_sales = {}
+
+    for offset in range(6):
+        month_start = add_months(start_month, offset)
+        month_key = month_start.strftime('%Y-%m')
+        revenue_by_month[month_key] = 0.0
+        orders_by_month[month_key] = 0
+
+    for order in orders:
+        payload = build_admin_order_payload(order)
+        month_key = month_range_start(order.created_at).strftime('%Y-%m')
+        orders_by_month[month_key] = orders_by_month.get(month_key, 0) + 1
+
+        if payload.get('payment_status') == 'paid':
+            paid_orders.append(payload)
+            revenue_by_month[month_key] = revenue_by_month.get(month_key, 0.0) + float(payload.get('grand_total_kes', 0) or 0)
+
+            for item in payload.get('items') or []:
+                name = item.get('product_name') or 'Unknown Product'
+                stats = product_sales.setdefault(name, {'name': name, 'sales': 0, 'units': 0, 'revenue': 0.0})
+                quantity = int(item.get('quantity', 0) or 0)
+                stats['units'] += quantity
+                stats['sales'] += quantity
+                stats['revenue'] += float(item.get('item_total_kes', 0) or 0)
+
+    monthly_series = []
+    for offset in range(6):
+        month_start = add_months(start_month, offset)
+        month_key = month_start.strftime('%Y-%m')
+        monthly_series.append({
+            'month': month_start.strftime('%b'),
+            'month_key': month_key,
+            'revenue': round(revenue_by_month.get(month_key, 0.0), 2),
+            'orders': int(orders_by_month.get(month_key, 0) or 0),
+        })
+
+    thirty_days_ago = now - timedelta(days=30)
+    recent_paid_orders = [
+        order for order in paid_orders
+        if parse_datetime_value(order.get('created_at')) and parse_datetime_value(order.get('created_at')) >= thirty_days_ago
+    ]
+    recent_customers = User.query.filter(
+        User.role == 'customer',
+        User.created_at >= thirty_days_ago,
+    ).count()
+    recent_revenue = round(sum(float(order.get('grand_total_kes', 0) or 0) for order in recent_paid_orders), 2)
+    recent_orders = len([order for order in orders if order.created_at >= thirty_days_ago])
+    avg_order_value = round(recent_revenue / len(recent_paid_orders), 2) if recent_paid_orders else 0
+
+    top_products = sorted(
+        product_sales.values(),
+        key=lambda item: (item['sales'], item['revenue']),
+        reverse=True,
+    )[:5]
+
+    return {
+        'summary': {
+            'revenue_30d_kes': recent_revenue,
+            'orders_30d': recent_orders,
+            'customers_30d': recent_customers,
+            'avg_order_value_30d_kes': avg_order_value,
+        },
+        'monthly': monthly_series,
+        'top_products': [
+            {
+                'name': product['name'],
+                'sales': product['sales'],
+                'units': product['units'],
+                'revenue': round(product['revenue'], 2),
+            }
+            for product in top_products
+        ],
+    }
+
 def convert_usd_to_kes(amount):
     return round(float(amount or 0) * 128.5, 2)
 
@@ -1346,7 +1460,7 @@ def build_mpesa_status_response(order):
     }
 
 def is_valid_customer_password(password):
-    return isinstance(password, str) and password.isdigit() and len(password) == 4
+    return is_valid_account_password(password, min_length=8)
 
 def seed_data():
     product_catalog = [
@@ -1412,13 +1526,7 @@ def seed_data():
         },
     ]
 
-    # Hard-sync catalog to match the initial main-site products.
-    # Any legacy products not in this category set are removed.
-    categories = {item['category'] for item in product_catalog}
-    for existing in Product.query.all():
-        if existing.category not in categories:
-            db.session.delete(existing)
-
+    force_sync_catalog = str(os.getenv('FORCE_SYNC_CATALOG', '')).strip().lower() in {'1', 'true', 'yes'}
     synced = 0
     for item in product_catalog:
         matches = Product.query.filter_by(category=item['category']).order_by(Product.id.asc()).all()
@@ -1430,13 +1538,28 @@ def seed_data():
                 db.session.delete(duplicate)
 
         if product:
-            product.name = item['name']
-            product.description = item['description']
-            product.base_price_usd = item['base_price_usd']
-            product.image_url = item['image_url']
-            product.in_stock = True
-            product.discount_percentage = item.get('discount_percentage', 0)
-            product.on_sale = item.get('on_sale', False)
+            if force_sync_catalog:
+                product.name = item['name']
+                product.description = item['description']
+                product.base_price_usd = item['base_price_usd']
+                product.image_url = item['image_url']
+                product.discount_percentage = item.get('discount_percentage', 0)
+                product.on_sale = item.get('on_sale', False)
+            else:
+                if not product.name:
+                    product.name = item['name']
+                if not product.description:
+                    product.description = item['description']
+                if not product.base_price_usd:
+                    product.base_price_usd = item['base_price_usd']
+                if not product.image_url:
+                    product.image_url = item['image_url']
+                if product.discount_percentage is None:
+                    product.discount_percentage = item.get('discount_percentage', 0)
+                if product.on_sale is None:
+                    product.on_sale = item.get('on_sale', False)
+                if product.in_stock is None:
+                    product.in_stock = True
         else:
             product = Product(
                 name=item['name'],
@@ -1450,7 +1573,8 @@ def seed_data():
             )
             db.session.add(product)
 
-        product.prices = item.get('prices', calculate_prices(product.base_price_usd))
+        if force_sync_catalog or not product.prices:
+            product.prices = item.get('prices', calculate_prices(product.base_price_usd))
         synced += 1
 
     db.session.commit()
@@ -1633,8 +1757,9 @@ def signup():
     if User.query.filter_by(email=data['email']).first():
         return jsonify({'message': 'Email already registered'}), 400
 
-    if not is_valid_customer_password(data['password']):
-        return jsonify({'message': 'Password must be exactly 4 digits'}), 400
+    password_error = get_account_password_validation_error(data['password'], min_length=8)
+    if password_error:
+        return jsonify({'message': password_error}), 400
 
     user = User(
         name=data['name'],
@@ -1680,8 +1805,9 @@ def register():
     if not username or not email or not password:
         return jsonify({'message': 'Username, email and password required'}), 400
 
-    if not is_valid_customer_password(password):
-        return jsonify({'message': 'Password must be exactly 4 digits'}), 400
+    password_error = get_account_password_validation_error(password, min_length=8)
+    if password_error:
+        return jsonify({'message': password_error}), 400
 
     if User.query.filter_by(email=email).first():
         return jsonify({'message': 'Email already registered'}), 400
@@ -1727,9 +1853,6 @@ def login():
 
     if not data.get('email') or not data.get('password'):
         return jsonify({'message': 'Email and password required'}), 400
-
-    if not is_valid_customer_password(data['password']):
-        return jsonify({'message': 'Password must be exactly 4 digits'}), 400
 
     user = User.query.filter_by(email=data['email']).first()
     if not user or not bcrypt.checkpw(data['password'].encode('utf-8'), user.password_hash.encode('utf-8')):
@@ -2201,6 +2324,14 @@ def admin_login():
     
     return build_admin_auth_response(user)
 
+@app.route('/admin/auth/me', methods=['GET'])
+@admin_required()
+def admin_auth_me():
+    return jsonify({
+        'status': 'success',
+        'user': build_admin_user_payload(get_current_user()),
+    })
+
 @app.route('/admin/dashboard/kpis', methods=['GET'])
 @admin_required()
 def get_dashboard_kpis():
@@ -2257,6 +2388,14 @@ def get_dashboard_kpis():
         'orders_change': trend_percent(current['orders_count'], previous['orders_count']),
         'customers_change': trend_percent(current['customers_count'], previous['customers_count']),
         'conversion_change': trend_percent(current['conversion_rate'], previous['conversion_rate']),
+    })
+
+@app.route('/admin/analytics/overview', methods=['GET'])
+@admin_required()
+def admin_analytics_overview():
+    return jsonify({
+        'status': 'success',
+        'analytics': build_admin_analytics_payload(),
     })
 
 @app.route('/admin/products', methods=['GET', 'POST'])
@@ -2408,12 +2547,19 @@ def admin_get_customers():
 @admin_required()
 def admin_change_password():
     user_id = int(get_jwt_identity())
-    data = request.get_json()
+    data = request.get_json() or {}
     
     user = User.query.get_or_404(user_id)
+
+    if not data.get('current_password') or not data.get('new_password'):
+        return jsonify({'error': 'Current password and new password are required'}), 400
     
     if not bcrypt.checkpw(data['current_password'].encode('utf-8'), user.password_hash.encode('utf-8')):
         return jsonify({'error': 'Current password is incorrect'}), 401
+
+    password_error = get_account_password_validation_error(data.get('new_password'), min_length=8)
+    if password_error:
+        return jsonify({'error': password_error}), 400
     
     user.password_hash = bcrypt.hashpw(data['new_password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
     db.session.commit()
@@ -2864,15 +3010,15 @@ def admin_content():
         # Return with defaults if not set
         return jsonify({
             'content': {
-                'hero_title': content_dict.get('hero_title', 'Queen Koba Skincare'),
-                'hero_subtitle': content_dict.get('hero_subtitle', 'Luxurious skincare for melanin-rich skin'),
-                'about_title': content_dict.get('about_title', 'Our Story'),
-                'about_description': content_dict.get('about_description', 'Queen Koba is dedicated to creating premium skincare products.'),
+                'hero_title': content_dict.get('hero_title', 'Dark Spots & Uneven Tone Stealing Your Glow?'),
+                'hero_subtitle': content_dict.get('hero_subtitle', 'Naturally brighten with toxin-free, melanin-safe luxury skincare.'),
+                'about_title': content_dict.get('about_title', 'Explore The Full Ritual'),
+                'about_description': content_dict.get('about_description', 'Explore our complete skincare lineup, mask, toner, serum, cream, and cleanser, curated to work together for healthier, glowing skin.'),
                 'contact_email': content_dict.get('contact_email', 'info@queenkoba.com'),
                 'contact_phone': content_dict.get('contact_phone', '0119 559 180'),
                 'contact_whatsapp': content_dict.get('contact_whatsapp', '0119 559 180'),
                 'instagram_handle': content_dict.get('instagram_handle', '@queenkoba'),
-                'footer_text': content_dict.get('footer_text', '© 2024 Queen Koba. All rights reserved.')
+                'footer_text': content_dict.get('footer_text', '© 2026 Queen Koba. All rights reserved.')
             }
         })
     else:
@@ -2920,6 +3066,9 @@ def admin_create_admin():
     password = data.get('password')
     if not email or not password:
         return jsonify({'error': 'Email and password are required'}), 400
+    password_error = get_account_password_validation_error(password, min_length=8)
+    if password_error:
+        return jsonify({'error': password_error}), 400
     if User.query.filter_by(email=email).first():
         return jsonify({'error': 'Email already exists'}), 400
 
@@ -2952,6 +3101,9 @@ def admin_update_admin(admin_id):
     if 'permissions' in data:
         admin.permissions = data['permissions']
     if data.get('password'):
+        password_error = get_account_password_validation_error(data['password'], min_length=8)
+        if password_error:
+            return jsonify({'error': password_error}), 400
         admin.password_hash = bcrypt.hashpw(data['password'].encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
     db.session.commit()

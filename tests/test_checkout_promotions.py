@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 
-TEST_DB_PATH = Path(__file__).with_name("test_checkout_promotions.db")
+TEST_DB_PATH = Path(__file__).with_name("test_backend_suite.db")
 os.environ["DATABASE_URL"] = f"sqlite:///{TEST_DB_PATH}"
 os.environ["JWT_SECRET_KEY"] = "test-checkout-promotions-secret-32-bytes"
 
@@ -23,13 +23,6 @@ class CheckoutPromotionTests(unittest.TestCase):
         backend.app.config["TESTING"] = True
         backend.app.db_initialized = True
         cls.client = backend.app.test_client()
-
-    @classmethod
-    def tearDownClass(cls):
-        try:
-            TEST_DB_PATH.unlink(missing_ok=True)
-        except OSError:
-            pass
 
     def setUp(self):
         with backend.app.app_context():
