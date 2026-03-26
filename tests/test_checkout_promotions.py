@@ -168,6 +168,75 @@ class CheckoutPromotionTests(unittest.TestCase):
             self.assertIsNotNone(usage)
             self.assertEqual(float((state.get("totals") or {}).get("discount_percent", 0) or 0), 10.0)
 
+    def test_validate_endpoint_returns_structured_success_payload(self):
+        serum_item, serum_subtotal = self._catalog_item("Serum")
+
+        response = self.client.post(
+            "/promotions/validate",
+            json={
+                "code": "WELCOME10",
+                "items": [{"product_id": serum_item["product_id"], "quantity": serum_item["quantity"]}],
+                "shipping_kes": 300,
+            },
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+
+        self.assertTrue(payload["exists"])
+        self.assertTrue(payload["valid"])
+        self.assertEqual(payload["promo_code"], "WELCOME10")
+        self.assertEqual(payload["discount_type"], "percentage")
+        self.assertAlmostEqual(payload["applied_discount_amount"], round(serum_subtotal * 0.10, 2))
+        self.assertAlmostEqual(
+            payload["updated_total"],
+            round(serum_subtotal + 300 - (serum_subtotal * 0.10), 2),
+        )
+        self.assertIsNotNone(payload["promo"])
+
+    def test_validate_endpoint_returns_not_found_and_expired_reasons(self):
+        serum_item, _ = self._catalog_item("Serum")
+
+        not_found_response = self.client.post(
+            "/promotions/validate",
+            json={
+                "code": "DOESNOTEXIST",
+                "items": [{"product_id": serum_item["product_id"], "quantity": serum_item["quantity"]}],
+                "shipping_kes": 300,
+            },
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(not_found_response.status_code, 200)
+        not_found_payload = not_found_response.get_json()
+        self.assertFalse(not_found_payload["exists"])
+        self.assertFalse(not_found_payload["valid"])
+        self.assertEqual(not_found_payload["reason"], "not_found")
+        self.assertIn("not found", not_found_payload["message"].lower())
+
+        with backend.app.app_context():
+            promo = backend.Promotion.query.filter_by(code="WELCOME10").first()
+            promo.expires = backend.now_utc() - backend.timedelta(days=1)
+            backend.db.session.commit()
+
+        expired_response = self.client.post(
+            "/promotions/validate",
+            json={
+                "code": "WELCOME10",
+                "items": [{"product_id": serum_item["product_id"], "quantity": serum_item["quantity"]}],
+                "shipping_kes": 300,
+            },
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(expired_response.status_code, 200)
+        expired_payload = expired_response.get_json()
+        self.assertTrue(expired_payload["exists"])
+        self.assertFalse(expired_payload["valid"])
+        self.assertEqual(expired_payload["reason"], "expired")
+        self.assertIn("expired", expired_payload["message"].lower())
+
     def test_welcome10_is_rejected_after_first_successful_order(self):
         serum_item, _ = self._catalog_item("Serum")
 

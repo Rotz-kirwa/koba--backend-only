@@ -695,6 +695,99 @@ def get_promo_usage_count_for_user(promo_id, user_id):
         return 0
     return PromotionUsage.query.filter_by(promo_code_id=promo_id, user_id=user_id).count()
 
+class PromoValidationError(ValueError):
+    def __init__(self, message, *, reason='invalid', exists=True):
+        super().__init__(message)
+        self.message = message
+        self.reason = reason
+        self.exists = exists
+
+def build_promo_validation_response(
+    *,
+    code,
+    valid,
+    exists,
+    message,
+    reason=None,
+    promo_summary=None,
+    subtotal_kes=0,
+    shipping_kes=0,
+):
+    summary = promo_summary or {}
+    discount_amount = round(float(summary.get('discount_amount', 0) or 0), 2)
+    shipping_discount = round(float(summary.get('shipping_discount', 0) or 0), 2)
+    applied_discount_amount = round(discount_amount + shipping_discount, 2)
+    resolved_shipping_kes = round(float(summary.get('shipping_kes', shipping_kes) or shipping_kes), 2)
+    updated_total = round(float(summary.get('final_total_kes', subtotal_kes + resolved_shipping_kes) or 0), 2)
+
+    return {
+        'exists': bool(exists),
+        'valid': bool(valid),
+        'message': message,
+        'reason': reason,
+        'promo_code': normalize_promo_code(code),
+        'discount_type': summary.get('discount_type'),
+        'discount_value': float(summary.get('discount_value', 0) or 0),
+        'discount_amount': discount_amount,
+        'shipping_discount': shipping_discount,
+        'applied_discount_amount': applied_discount_amount,
+        'subtotal_kes': round(float(summary.get('subtotal_kes', subtotal_kes) or subtotal_kes), 2),
+        'shipping_kes': resolved_shipping_kes,
+        'updated_total': updated_total,
+        'final_total_kes': updated_total,
+        'campaign_type': summary.get('campaign_type') or '',
+        'description': summary.get('description') or '',
+        'promo': summary if valid else None,
+    }
+
+def validate_promotion_request(user, data):
+    code = normalize_promo_code(data.get('code') or data.get('promo_code'))
+    if not code:
+        return build_promo_validation_response(
+            code='',
+            valid=False,
+            exists=False,
+            message='Promo code is required',
+            reason='missing_code',
+        )
+
+    try:
+        order_items = resolve_order_items_for_promo_request(user, data)
+    except ValueError as error:
+        return build_promo_validation_response(
+            code=code,
+            valid=False,
+            exists=True,
+            message=str(error),
+            reason='cart_empty',
+        )
+
+    shipping_kes = resolve_shipping_kes(data)
+    subtotal_kes = round(sum(float(item.get('item_total_kes', 0) or 0) for item in order_items), 2)
+    promo = Promotion.query.filter_by(code=code).first()
+
+    try:
+        summary = evaluate_promotion(promo, user, order_items, shipping_kes)
+        return build_promo_validation_response(
+            code=code,
+            valid=True,
+            exists=True,
+            message=summary.get('message') or 'Promo code applied successfully',
+            promo_summary=summary,
+            subtotal_kes=subtotal_kes,
+            shipping_kes=shipping_kes,
+        )
+    except PromoValidationError as error:
+        return build_promo_validation_response(
+            code=code,
+            valid=False,
+            exists=error.exists,
+            message=error.message,
+            reason=error.reason,
+            subtotal_kes=subtotal_kes,
+            shipping_kes=shipping_kes,
+        )
+
 def build_promotion_payload(promo, include_stats=False):
     usage_stats = build_promotion_stats(promo) if include_stats else {}
     product_ids = sorted(get_promotion_product_ids(promo))
@@ -1010,7 +1103,16 @@ def resolve_shipping_kes(data):
 
     delivery = data.get('delivery') or {}
     totals = data.get('totals') or {}
-    return max(parse_float(delivery.get('shipping_fee', totals.get('shipping_kes')), 0), 0)
+    return max(
+        parse_float(
+            delivery.get(
+                'shipping_fee',
+                totals.get('shipping_kes', data.get('shipping_kes', data.get('shipping_fee'))),
+            ),
+            0,
+        ),
+        0,
+    )
 
 def evaluate_promotion(promo, user, order_items, shipping_kes):
     current_time = now_utc()
@@ -1018,34 +1120,46 @@ def evaluate_promotion(promo, user, order_items, shipping_kes):
     subtotal_kes = round(sum(float(item.get('item_total_kes', 0) or 0) for item in order_items), 2)
 
     if not promo:
-        raise ValueError('Invalid promo code')
+        raise PromoValidationError('Promo code not found', reason='not_found', exists=False)
 
-    if not promo_is_active(promo, current_time=current_time):
-        raise ValueError('This promo code is inactive or outside its valid date range')
+    if promo.status != 'active':
+        raise PromoValidationError('This promo code is not active', reason='inactive')
+
+    if promo.starts_at and promo.starts_at > current_time:
+        raise PromoValidationError('This promo code has not started yet', reason='not_started')
+
+    if promo.expires and promo.expires < current_time:
+        raise PromoValidationError('This promo code has expired', reason='expired')
 
     if promo.limit is not None and int(promo.uses or 0) >= int(promo.limit):
-        raise ValueError('This promo code has reached its usage limit')
+        raise PromoValidationError('This promo code has reached its usage limit', reason='usage_limit_reached')
 
     if promo.customer_scope == 'selected_users':
         if not user:
-            raise ValueError('Sign in to use this promo code')
+            raise PromoValidationError('Sign in to use this promo code', reason='sign_in_required')
         if user.id not in get_promotion_user_ids(promo):
-            raise ValueError('This promo code is not available for your account')
+            raise PromoValidationError('This promo code is not available for your account', reason='account_not_eligible')
 
     if promo.first_order_only:
         if not user:
-            raise ValueError('Sign in to use this first-order promo code')
+            raise PromoValidationError('Sign in to use this first-order promo code', reason='sign_in_required')
         if get_effective_order_count(user.id) > 0:
-            raise ValueError('This promo code is only available on your first order')
+            raise PromoValidationError('This promo code is only available on your first order', reason='first_order_only')
 
     if promo.per_user_limit is not None:
         if not user:
-            raise ValueError('Sign in to use this promo code')
+            raise PromoValidationError('Sign in to use this promo code', reason='sign_in_required')
         if get_promo_usage_count_for_user(promo.id, user.id) >= int(promo.per_user_limit):
-            raise ValueError('You have already used this promo code the maximum number of times')
+            raise PromoValidationError(
+                'You have already used this promo code the maximum number of times',
+                reason='per_user_limit_reached',
+            )
 
     if promo.min_order_amount and subtotal_kes < float(promo.min_order_amount):
-        raise ValueError(f'This promo code requires a minimum order of KSh {float(promo.min_order_amount):,.0f}')
+        raise PromoValidationError(
+            f'This promo code requires a minimum order of KSh {float(promo.min_order_amount):,.0f}',
+            reason='minimum_order_not_met',
+        )
 
     eligible_items = list(order_items)
     if promo.applies_to_type == 'products':
@@ -1060,7 +1174,7 @@ def evaluate_promotion(promo, user, order_items, shipping_kes):
 
     eligible_subtotal_kes = round(sum(float(item.get('item_total_kes', 0) or 0) for item in eligible_items), 2)
     if promo.applies_to_type != 'all' and eligible_subtotal_kes <= 0:
-        raise ValueError('This promo code does not apply to the current cart')
+        raise PromoValidationError('This promo code does not apply to the current cart', reason='not_applicable')
 
     discount_amount = 0
     shipping_discount = 0
@@ -2750,44 +2864,21 @@ def get_active_promotions():
 @app.route('/promotions/validate', methods=['POST'])
 def validate_promo_code():
     data = request.get_json() or {}
-    code = normalize_promo_code(data.get('code'))
-    if not code:
-        return jsonify({'error': 'Promo code is required'}), 400
-
     user = get_optional_current_user()
-
-    try:
-        order_items = resolve_order_items_for_promo_request(user, data)
-        shipping_kes = resolve_shipping_kes(data)
-        promo = Promotion.query.filter_by(code=code).first()
-        summary = evaluate_promotion(promo, user, order_items, shipping_kes)
-    except ValueError as error:
-        return jsonify({'error': str(error)}), 400
-
+    validation = validate_promotion_request(user, data)
     return jsonify({
-        'status': 'success',
-        'promo': summary,
+        'status': 'success' if validation.get('valid') else 'invalid',
+        **validation,
     })
 
 @app.route('/cart/apply-promocode', methods=['POST'])
 def apply_cart_promo_code():
     data = request.get_json() or {}
-    data['code'] = normalize_promo_code(data.get('code'))
-    if not data.get('code'):
-        return jsonify({'error': 'Promo code is required'}), 400
-
     user = get_optional_current_user()
-    try:
-        order_items = resolve_order_items_for_promo_request(user, data)
-        shipping_kes = resolve_shipping_kes(data)
-        promo = Promotion.query.filter_by(code=data['code']).first()
-        summary = evaluate_promotion(promo, user, order_items, shipping_kes)
-    except ValueError as error:
-        return jsonify({'error': str(error)}), 400
-
+    validation = validate_promotion_request(user, data)
     return jsonify({
-        'status': 'success',
-        'promo': summary,
+        'status': 'success' if validation.get('valid') else 'invalid',
+        **validation,
     })
 
 @app.route('/cart/remove-promocode', methods=['DELETE'])

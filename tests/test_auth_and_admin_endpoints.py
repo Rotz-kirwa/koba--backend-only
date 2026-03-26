@@ -98,6 +98,61 @@ class AuthAndAdminEndpointTests(unittest.TestCase):
         self.assertIn("summary", analytics)
         self.assertIn("top_products", analytics)
 
+    def test_admin_can_create_and_update_promotions_with_restrictions(self):
+        with backend.app.app_context():
+            product = backend.Product.query.first()
+            self.assertIsNotNone(product)
+
+        create_response = self.client.post(
+            "/admin/promotions",
+            json={
+                "code": "SPRING15",
+                "description": "Spring glow offer",
+                "campaign_type": "seasonal",
+                "discount_type": "percentage",
+                "discount_value": 15,
+                "is_active": True,
+                "applies_to_type": "products",
+                "product_ids": [product.id],
+                "usage_limit": 50,
+                "per_user_limit": 1,
+                "min_order_amount": 3000,
+            },
+            headers=self._admin_headers(),
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+        created = create_response.get_json()["promotion"]
+        self.assertEqual(created["code"], "SPRING15")
+        self.assertEqual(created["applies_to_type"], "products")
+        self.assertEqual(created["product_ids"], [product.id])
+
+        update_response = self.client.put(
+            f"/admin/promotions/{created['_id']}",
+            json={
+                "code": "SPRING15",
+                "description": "Spring glow offer updated",
+                "campaign_type": "seasonal",
+                "discount_type": "fixed",
+                "discount_value": 500,
+                "is_active": False,
+                "applies_to_type": "categories",
+                "categories": ["serum"],
+                "usage_limit": 25,
+                "per_user_limit": 2,
+                "min_order_amount": 2500,
+            },
+            headers=self._admin_headers(),
+        )
+
+        self.assertEqual(update_response.status_code, 200)
+        updated = update_response.get_json()["promotion"]
+        self.assertEqual(updated["description"], "Spring glow offer updated")
+        self.assertEqual(updated["discount_type"], "fixed")
+        self.assertEqual(updated["status"], "inactive")
+        self.assertEqual(updated["applies_to_type"], "categories")
+        self.assertEqual(updated["categories"], ["serum"])
+
 
 if __name__ == "__main__":
     unittest.main()
