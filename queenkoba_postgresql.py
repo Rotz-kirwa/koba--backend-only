@@ -296,6 +296,29 @@ def get_google_allowed_admin_emails():
     emails = [value.strip().lower() for value in raw_values if value.strip()]
     return list(dict.fromkeys(emails))
 
+def build_customer_user_payload(user):
+    return {
+        'id': str(user.id),
+        '_id': str(user.id),
+        'name': user.name or user.username or user.email.split('@')[0],
+        'username': user.username or user.name or user.email.split('@')[0],
+        'email': user.email,
+        'phone': user.phone or '',
+        'country': user.country,
+        'preferred_currency': user.preferred_currency,
+        'role': user.role,
+    }
+
+def build_customer_auth_response(user, status_code=200):
+    token = create_access_token(identity=str(user.id))
+    return jsonify({
+        'status': 'success',
+        'message': 'Login successful',
+        'token': token,
+        'access_token': token,
+        'user': build_customer_user_payload(user)
+    }), status_code
+
 def build_admin_user_payload(user):
     return {
         '_id': str(user.id),
@@ -388,6 +411,36 @@ def get_or_create_google_admin_user(profile):
     db.session.add(user)
     db.session.commit()
     return user
+
+def get_or_create_google_customer_user(profile):
+    email = profile['email']
+    name = profile.get('name') or profile.get('given_name') or email.split('@')[0]
+
+    user = User.query.filter_by(email=email).first()
+
+    if user:
+        if not user.name:
+            user.name = name
+        if not user.username:
+            user.username = name
+        if not user.phone:
+            user.phone = ''
+        db.session.commit()
+        return user, False
+
+    user = User(
+        name=name,
+        username=name,
+        email=email,
+        phone='',
+        password_hash=bcrypt.hashpw(uuid.uuid4().hex.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+        role='customer',
+        country='Kenya',
+        preferred_currency='KES',
+    )
+    db.session.add(user)
+    db.session.commit()
+    return user, True
 
 def get_order_payment_state(order):
     if not order.status_note:
@@ -987,15 +1040,27 @@ def login():
     })
 
 @app.route('/auth/google', methods=['GET', 'POST'])
-@app.route('/admin/auth/google', methods=['POST'])
-def google_login():
+def customer_google_login():
     if request.method == 'GET':
         return jsonify({
             'status': 'ready',
-            'message': 'Google sign-in is enabled. Send a POST request with a credential token.',
+            'message': 'Customer Google sign-in is enabled. Send a POST request with a credential token.',
             'allowed_client_ids': get_google_client_ids(),
         })
 
+    data = request.get_json(silent=True) or {}
+    credential = data.get('credential') or data.get('id_token') or data.get('token')
+
+    try:
+        profile = verify_google_credential(credential)
+        user, created = get_or_create_google_customer_user(profile)
+    except ValueError as exc:
+        return jsonify({'message': str(exc)}), 400
+
+    return build_customer_auth_response(user, 201 if created else 200)
+
+@app.route('/admin/auth/google', methods=['POST'])
+def admin_google_login():
     data = request.get_json(silent=True) or {}
     credential = data.get('credential') or data.get('id_token') or data.get('token')
 
