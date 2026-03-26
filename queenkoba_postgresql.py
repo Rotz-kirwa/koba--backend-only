@@ -13,6 +13,8 @@ import requests
 
 load_dotenv()
 
+DEFAULT_GOOGLE_CLIENT_ID = '445338583811-0gknu3ni8fn9mh3pa874agtu61i29tvr.apps.googleusercontent.com'
+
 app = Flask(__name__)
 
 # CORS Configuration - Allow frontend and admin URLs
@@ -270,6 +272,122 @@ def get_mpesa_access_token():
     if not token:
         raise ValueError('Safaricom OAuth token missing from response')
     return token
+
+def get_google_client_ids():
+    raw_values = []
+    for env_name in ('GOOGLE_CLIENT_IDS', 'GOOGLE_CLIENT_ID'):
+        raw = os.getenv(env_name, '')
+        if raw:
+            raw_values.extend(raw.split(','))
+
+    client_ids = [value.strip() for value in raw_values if value.strip()]
+    if not client_ids:
+        client_ids = [DEFAULT_GOOGLE_CLIENT_ID]
+
+    return list(dict.fromkeys(client_ids))
+
+def get_google_allowed_admin_emails():
+    raw_values = []
+    for env_name in ('GOOGLE_ALLOWED_EMAILS', 'ADMIN_GOOGLE_EMAILS', 'GOOGLE_ADMIN_EMAILS'):
+        raw = os.getenv(env_name, '')
+        if raw:
+            raw_values.extend(raw.split(','))
+
+    emails = [value.strip().lower() for value in raw_values if value.strip()]
+    return list(dict.fromkeys(emails))
+
+def build_admin_user_payload(user):
+    return {
+        '_id': str(user.id),
+        'email': user.email,
+        'full_name': user.username or user.name or 'Admin',
+        'role': user.role,
+        'permissions': user.permissions or ['*']
+    }
+
+def build_admin_auth_response(user):
+    token = create_access_token(identity=str(user.id))
+    return jsonify({
+        'token': token,
+        'user': build_admin_user_payload(user)
+    })
+
+def verify_google_credential(credential):
+    if not credential:
+        raise ValueError('Google credential is required')
+
+    try:
+        response = requests.get(
+            'https://oauth2.googleapis.com/tokeninfo',
+            params={'id_token': credential},
+            timeout=10,
+        )
+        payload = response.json()
+    except requests.RequestException:
+        raise ValueError('Could not verify Google sign-in right now') from None
+    except ValueError:
+        raise ValueError('Google sign-in returned an invalid response') from None
+
+    if response.status_code != 200:
+        detail = payload.get('error_description') or payload.get('error') or 'Invalid Google credential'
+        raise ValueError(detail)
+
+    audience = (payload.get('aud') or '').strip()
+    if audience not in get_google_client_ids():
+        raise ValueError('Google sign-in does not match the configured client')
+
+    email = (payload.get('email') or '').strip().lower()
+    if not email:
+        raise ValueError('Google sign-in did not return an email address')
+
+    if str(payload.get('email_verified')).lower() != 'true':
+        raise ValueError('A verified Google email is required to continue')
+
+    return {
+        'email': email,
+        'name': (payload.get('name') or '').strip(),
+        'given_name': (payload.get('given_name') or '').strip(),
+        'sub': (payload.get('sub') or '').strip(),
+    }
+
+def get_or_create_google_admin_user(profile):
+    email = profile['email']
+    name = profile.get('name') or profile.get('given_name') or email.split('@')[0]
+    allowed_emails = get_google_allowed_admin_emails()
+    email_is_allowed = email in allowed_emails if allowed_emails else False
+
+    user = User.query.filter_by(email=email).first()
+
+    if user:
+        if user.role not in ['admin', 'super_admin'] and not email_is_allowed:
+            raise PermissionError('This Google account is not approved for admin access')
+
+        if not user.name:
+            user.name = name
+        if not user.username:
+            user.username = name
+        if user.role not in ['admin', 'super_admin'] and email_is_allowed:
+            user.role = 'admin'
+            user.permissions = user.permissions or ['*']
+
+        db.session.commit()
+        return user
+
+    if not email_is_allowed:
+        raise PermissionError('This Google account is not approved for admin access')
+
+    user = User(
+        name=name,
+        username=name,
+        email=email,
+        phone='',
+        password_hash=bcrypt.hashpw(uuid.uuid4().hex.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+        role='admin',
+        permissions=['*']
+    )
+    db.session.add(user)
+    db.session.commit()
+    return user
 
 def get_order_payment_state(order):
     if not order.status_note:
@@ -868,9 +986,28 @@ def login():
         }
     })
 
-@app.route('/auth/google', methods=['GET'])
+@app.route('/auth/google', methods=['GET', 'POST'])
+@app.route('/admin/auth/google', methods=['POST'])
 def google_login():
-    return jsonify({'message': 'Google OAuth not configured yet'}), 501
+    if request.method == 'GET':
+        return jsonify({
+            'status': 'ready',
+            'message': 'Google sign-in is enabled. Send a POST request with a credential token.',
+            'allowed_client_ids': get_google_client_ids(),
+        })
+
+    data = request.get_json(silent=True) or {}
+    credential = data.get('credential') or data.get('id_token') or data.get('token')
+
+    try:
+        profile = verify_google_credential(credential)
+        user = get_or_create_google_admin_user(profile)
+    except ValueError as exc:
+        return jsonify({'message': str(exc)}), 400
+    except PermissionError as exc:
+        return jsonify({'message': str(exc)}), 403
+
+    return build_admin_auth_response(user)
 
 @app.route('/auth/profile', methods=['GET'])
 @jwt_required()
@@ -1290,18 +1427,7 @@ def admin_login():
     if not bcrypt.checkpw(data['password'].encode('utf-8'), user.password_hash.encode('utf-8')):
         return jsonify({'error': 'Invalid credentials'}), 401
     
-    token = create_access_token(identity=str(user.id))
-    
-    return jsonify({
-        'token': token,
-        'user': {
-            '_id': str(user.id),
-            'email': user.email,
-            'full_name': user.username or 'Admin',
-            'role': user.role,
-            'permissions': user.permissions or ['*']
-        }
-    })
+    return build_admin_auth_response(user)
 
 @app.route('/admin/dashboard/kpis', methods=['GET'])
 @jwt_required()
