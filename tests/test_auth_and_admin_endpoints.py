@@ -98,6 +98,22 @@ class AuthAndAdminEndpointTests(unittest.TestCase):
         self.assertIn("summary", analytics)
         self.assertIn("top_products", analytics)
 
+    def test_public_products_and_content_support_lite_mode(self):
+        products_response = self.client.get("/products?lite=true&limit=3")
+        self.assertEqual(products_response.status_code, 200)
+        products_payload = products_response.get_json()
+        self.assertTrue(products_payload["lite"])
+        self.assertLessEqual(products_payload["count"], 3)
+        self.assertTrue(products_payload["products"])
+        self.assertNotIn("base_price_usd", products_payload["products"][0])
+
+        content_response = self.client.get("/content?lite=true")
+        self.assertEqual(content_response.status_code, 200)
+        content_payload = content_response.get_json()
+        self.assertTrue(content_payload["lite"])
+        self.assertIn("hero_title", content_payload["content"])
+        self.assertIn("footer_text", content_payload["content"])
+
     def test_admin_can_create_and_update_promotions_with_restrictions(self):
         with backend.app.app_context():
             product = backend.Product.query.first()

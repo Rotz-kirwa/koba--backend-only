@@ -322,6 +322,38 @@ def parse_float(value, default=0):
         return default
     return float(value)
 
+def parse_bool(value, default=False):
+    if value in (None, ''):
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+def build_public_product_payload(product, lite=False):
+    payload = {
+        '_id': str(product.id),
+        'id': str(product.id),
+        'name': product.name,
+        'category': product.category,
+        'prices': product.prices,
+        'in_stock': product.in_stock,
+        'image_url': product.image_url,
+        'discount_percentage': product.discount_percentage or 0,
+        'on_sale': product.on_sale or False,
+    }
+
+    if not lite:
+        payload.update({
+            'description': product.description,
+            'base_price_usd': product.base_price_usd,
+        })
+    else:
+        payload.update({
+            'description': (product.description or '')[:140],
+        })
+
+    return payload
+
 def generate_random_promo_code(prefix='QK', length=8):
     seed = uuid.uuid4().hex.upper()
     core = seed[:max(length, 4)]
@@ -1019,7 +1051,10 @@ def normalize_delivery_text(value):
 
 def normalize_delivery_zone(value):
     normalized = normalize_delivery_text(value).lower().replace('-', '_').replace(' ', '_')
-    if normalized in {'nairobi', 'within_nairobi'}:
+    if (
+        normalized in {'nairobi', 'within_nairobi'}
+        or ('nairobi' in normalized and not normalized.startswith('outside'))
+    ):
         return 'nairobi'
     if normalized in {'outside_nairobi', 'outside'}:
         return 'outside_nairobi'
@@ -1927,22 +1962,17 @@ def health_check():
 
 @app.route('/products', methods=['GET'])
 def get_products():
-    products = Product.query.all()
+    lite = parse_bool(request.args.get('lite'))
+    limit = parse_int(request.args.get('limit'))
+    products_query = Product.query.order_by(Product.id.asc())
+    if limit and limit > 0:
+        products_query = products_query.limit(limit)
+    products = products_query.all()
     return jsonify({
         'status': 'success',
+        'lite': lite,
         'count': len(products),
-        'products': [{
-            '_id': str(p.id),
-            'name': p.name,
-            'description': p.description,
-            'category': p.category,
-            'base_price_usd': p.base_price_usd,
-            'prices': p.prices,
-            'in_stock': p.in_stock,
-            'image_url': p.image_url,
-            'discount_percentage': p.discount_percentage or 0,
-            'on_sale': p.on_sale or False
-        } for p in products]
+        'products': [build_public_product_payload(p, lite=lite) for p in products]
     })
 
 @app.route('/products/<int:product_id>', methods=['GET'])
@@ -3239,7 +3269,36 @@ def admin_content():
 @app.route('/content', methods=['GET'])
 def public_content():
     all_content = SiteContent.query.all()
-    return jsonify({'content': {c.key: c.value for c in all_content}})
+    lite = parse_bool(request.args.get('lite'))
+    content = {
+        'hero_title': 'Dark Spots & Uneven Tone Stealing Your Glow?',
+        'hero_subtitle': 'Naturally brighten with toxin-free, melanin-safe luxury skincare.',
+        'about_title': 'Explore The Full Ritual',
+        'about_description': 'Explore our complete skincare lineup, mask, toner, serum, cream, and cleanser, curated to work together for healthier, glowing skin.',
+        'contact_email': 'info@queenkoba.com',
+        'contact_phone': '0119 559 180',
+        'contact_whatsapp': '0119 559 180',
+        'instagram_handle': '@queenkoba',
+        'footer_text': '© 2026 Queen Koba. All rights reserved.',
+    }
+    content.update({c.key: c.value for c in all_content})
+    if lite:
+        content = {
+            key: value for key, value in content.items()
+            if key in {
+                'hero_title',
+                'hero_subtitle',
+                'about_title',
+                'about_description',
+                'contact_email',
+                'contact_phone',
+                'contact_whatsapp',
+                'instagram_handle',
+                'footer_text',
+            }
+        }
+
+    return jsonify({'content': content, 'lite': lite})
 
 @app.route('/admin/admins', methods=['GET'])
 @admin_required()

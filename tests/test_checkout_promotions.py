@@ -307,6 +307,26 @@ class CheckoutPromotionTests(unittest.TestCase):
             self.assertEqual((order.shipping_address or {}).get("county"), "Nakuru")
             self.assertEqual((order.shipping_address or {}).get("area"), "Nakuru Town")
 
+    def test_nairobi_like_county_values_still_use_nairobi_shipping_rate(self):
+        serum_item, serum_subtotal = self._catalog_item("Serum")
+
+        response = self.client.post(
+            "/checkout",
+            json=self._checkout_payload(
+                [serum_item],
+                shipping_fee=500,
+                county="Nairobi County",
+                area="Westlands",
+                delivery_point="Sarit Centre stage",
+            ),
+            headers=self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        promo = response.get_json()["promo"]
+        self.assertAlmostEqual(promo["shipping_kes"], 300)
+        self.assertAlmostEqual(promo["final_total_kes"], round(serum_subtotal + 300, 2))
+
     def test_checkout_rejects_missing_structured_delivery_fields(self):
         serum_item, _ = self._catalog_item("Serum")
         payload = self._checkout_payload([serum_item], shipping_fee=300)
