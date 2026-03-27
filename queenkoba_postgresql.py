@@ -1546,6 +1546,33 @@ def resolve_order_totals_kes(order, state, items):
 
     return subtotal_kes, shipping_kes, grand_total_kes
 
+def parse_payment_datetime_value(value):
+    if value in (None, '', False):
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    if text.isdigit() and len(text) == 14:
+        try:
+            return datetime.strptime(text, '%Y%m%d%H%M%S')
+        except ValueError:
+            return None
+
+    try:
+        return parse_datetime_value(text)
+    except (TypeError, ValueError):
+        return None
+
+def serialize_datetime_value(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
 def resolve_payment_status(order, state):
     if order.payment_method != 'mpesa':
         return order.payment_status or 'pending'
@@ -1583,21 +1610,64 @@ def build_admin_order_payload(order):
     customer_email = customer.get('email') or shipping_address.get('email') or (order.user.email if order.user else None)
     customer_phone = customer.get('phone') or shipping_address.get('phone') or (order.user.phone if order.user else None)
     payment_status = resolve_payment_status(order, state)
+    delivery_zone = delivery.get('delivery_zone') or shipping_address.get('delivery_zone')
+    delivery_zone_code = delivery.get('delivery_zone_code') or shipping_address.get('delivery_zone_code')
+    county = delivery.get('county') or shipping_address.get('county')
+    area = delivery.get('area') or shipping_address.get('area')
+    delivery_point = (
+        delivery.get('delivery_point')
+        or delivery.get('point')
+        or shipping_address.get('delivery_point')
+    )
+    delivery_method = delivery.get('method') or shipping_address.get('delivery_method')
+    delivery_eta = delivery.get('eta') or shipping_address.get('delivery_eta')
+    payment_reference = state.get('payment_reference') or receipt_number
+    payment_phone = (
+        state.get('phone_number')
+        or payment_details.get('phone_number')
+        or customer_phone
+    )
+    raw_paid_at = (
+        state.get('paid_at')
+        or state.get('payment_confirmed_at')
+        or state.get('transaction_date')
+    )
+    paid_at = parse_payment_datetime_value(raw_paid_at)
+    if not paid_at and payment_status == 'paid':
+        paid_at = order.updated_at or order.created_at
 
     return {
         '_id': str(order.id),
         'order_id': order.order_id,
         'user_id': str(order.user_id),
+        'customer': {
+            'id': str(order.user_id),
+            'name': customer_name,
+            'email': customer_email,
+            'phone': customer_phone,
+        },
         'customer_name': customer_name,
         'customer_email': customer_email,
         'customer_phone': customer_phone,
         'items': items,
         'shipping_address': shipping_address,
         'delivery': delivery,
+        'delivery_zone': delivery_zone,
+        'delivery_zone_code': delivery_zone_code,
+        'county': county,
+        'area': area,
+        'delivery_point': delivery_point,
+        'delivery_method': delivery_method,
+        'delivery_eta': delivery_eta,
         'payment_method': order.payment_method,
         'payment_status': payment_status,
         'payment_details': payment_details,
         'payment_receipt': receipt_number,
+        'payment_reference': payment_reference,
+        'payment_phone': str(payment_phone) if payment_phone not in (None, '') else None,
+        'payment_provider': state.get('provider') or order.payment_method,
+        'transaction_date': serialize_datetime_value(parse_payment_datetime_value(state.get('transaction_date'))),
+        'paid_at': serialize_datetime_value(paid_at),
         'payment_state': state,
         'events': events,
         'last_event': events[-1] if events else None,
@@ -1613,6 +1683,13 @@ def build_admin_order_payload(order):
         'discount_amount': float(order.discount_amount or (state.get('totals') or {}).get('discount_amount', 0) or 0),
         'shipping_discount': float(order.shipping_discount or (state.get('totals') or {}).get('shipping_discount', 0) or 0),
         'final_total_after_discount': float(order.final_total_after_discount or grand_total_kes),
+        'totals': {
+            'subtotal_kes': subtotal_kes,
+            'shipping_kes': shipping_kes,
+            'discount_amount': float(order.discount_amount or (state.get('totals') or {}).get('discount_amount', 0) or 0),
+            'shipping_discount': float(order.shipping_discount or (state.get('totals') or {}).get('shipping_discount', 0) or 0),
+            'grand_total_kes': grand_total_kes,
+        },
         'promo': promo,
         'total_usd': order.total_usd,
         'created_at': order.created_at.isoformat(),
@@ -2425,13 +2502,23 @@ def mpesa_callback():
         result_code = callback.get('ResultCode')
         result_desc = callback.get('ResultDesc')
         metadata = extract_mpesa_callback_metadata(callback.get('CallbackMetadata', {}))
+        transaction_datetime = parse_payment_datetime_value(metadata.get('TransactionDate'))
+        confirmed_at = now_utc().isoformat()
 
         set_order_payment_state(
             order,
             result_code=result_code,
             result_desc=result_desc,
             receipt_number=metadata.get('MpesaReceiptNumber'),
+            payment_reference=metadata.get('MpesaReceiptNumber'),
             transaction_date=metadata.get('TransactionDate'),
+            payment_provider='mpesa',
+            payment_confirmed_at=confirmed_at if result_code == 0 else get_order_payment_state(order).get('payment_confirmed_at'),
+            paid_at=(
+                transaction_datetime.isoformat()
+                if result_code == 0 and transaction_datetime
+                else confirmed_at if result_code == 0 else get_order_payment_state(order).get('paid_at')
+            ),
             amount_kes=metadata.get('Amount') or get_order_payment_state(order).get('amount_kes'),
             phone_number=metadata.get('PhoneNumber') or get_order_payment_state(order).get('phone_number'),
             callback_payload=data,
@@ -2516,6 +2603,9 @@ def mpesa_status(order_ref):
         result_desc=result_desc,
         query_payload=query_response,
         query_error=None,
+        payment_provider='mpesa',
+        payment_confirmed_at=now_utc().isoformat() if result_code == 0 else state.get('payment_confirmed_at'),
+        paid_at=now_utc().isoformat() if result_code == 0 else state.get('paid_at'),
     )
     if result_code == 0:
         append_order_event(
@@ -2726,9 +2816,75 @@ def admin_product(product_id):
 @app.route('/admin/orders', methods=['GET'])
 @admin_required()
 def admin_get_orders():
-    orders = Order.query.order_by(Order.created_at.desc()).limit(50).all()
+    search = normalize_delivery_text(request.args.get('search'))
+    payment_status_filter = normalize_delivery_text(request.args.get('payment_status')).lower()
+    delivery_zone_filter = normalize_delivery_text(request.args.get('delivery_zone')).lower().replace(' ', '_').replace('-', '_')
+    order_status_filter = normalize_delivery_text(request.args.get('order_status')).lower()
+    payment_method_filter = normalize_delivery_text(request.args.get('payment_method')).lower()
+    limit = parse_int(request.args.get('limit'), 100) or 100
+    limit = max(1, min(limit, 500))
+
+    orders = Order.query.order_by(Order.created_at.desc()).all()
+    payloads = [build_admin_order_payload(o) for o in orders]
+
+    if search:
+        search_value = search.lower()
+        payloads = [
+            payload for payload in payloads
+            if search_value in ' '.join([
+                str(payload.get('order_id') or ''),
+                str(payload.get('customer_name') or ''),
+                str(payload.get('customer_email') or ''),
+                str(payload.get('customer_phone') or ''),
+                str(payload.get('payment_reference') or ''),
+                str(payload.get('delivery_zone') or ''),
+                str(payload.get('county') or ''),
+                str(payload.get('area') or ''),
+                str(payload.get('delivery_point') or ''),
+            ]).lower()
+        ]
+
+    if payment_status_filter and payment_status_filter != 'all':
+        if payment_status_filter == 'unpaid':
+            payloads = [payload for payload in payloads if payload.get('payment_status') != 'paid']
+        else:
+            payloads = [
+                payload for payload in payloads
+                if str(payload.get('payment_status') or '').lower() == payment_status_filter
+            ]
+
+    if delivery_zone_filter and delivery_zone_filter != 'all':
+        payloads = [
+            payload for payload in payloads
+            if normalize_delivery_zone(
+                payload.get('delivery_zone_code') or payload.get('delivery_zone')
+            ) == normalize_delivery_zone(delivery_zone_filter)
+        ]
+
+    if order_status_filter and order_status_filter != 'all':
+        payloads = [
+            payload for payload in payloads
+            if str(payload.get('order_status') or '').lower() == order_status_filter
+        ]
+
+    if payment_method_filter and payment_method_filter != 'all':
+        payloads = [
+            payload for payload in payloads
+            if str(payload.get('payment_method') or '').lower() == payment_method_filter
+        ]
+
+    payloads = payloads[:limit]
     return jsonify({
-        'orders': [build_admin_order_payload(o) for o in orders]
+        'orders': payloads,
+        'count': len(payloads),
+    })
+
+@app.route('/admin/orders/<int:order_id>', methods=['GET'])
+@admin_required()
+def admin_get_order(order_id):
+    order = Order.query.get_or_404(order_id)
+    return jsonify({
+        'order': build_admin_order_payload(order)
     })
 
 @app.route('/admin/orders/<int:order_id>/status', methods=['PUT'])
