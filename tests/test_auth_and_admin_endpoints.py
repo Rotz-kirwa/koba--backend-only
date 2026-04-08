@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 TEST_DB_PATH = Path(__file__).with_name("test_backend_suite.db")
@@ -117,6 +118,97 @@ class AuthAndAdminEndpointTests(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload["user"]["email"], email)
         self.assertTrue(payload.get("token"))
+
+    def test_google_login_creates_customer_with_safe_defaults(self):
+        profile = {
+            "email": "eliudkirwa451@gmail.com",
+            "name": "Eliud Kirwa",
+            "given_name": "Eliud",
+            "sub": "google-sub-123",
+        }
+
+        with mock.patch.object(backend, "verify_google_credential", return_value=profile):
+            response = self.client.post("/auth/google", json={"credential": "fake-google-token"})
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()
+        self.assertEqual(payload["user"]["email"], profile["email"])
+        self.assertEqual(payload["user"]["username"], "eliud-kirwa")
+
+        with backend.app.app_context():
+            user = backend.User.query.filter_by(email=profile["email"]).first()
+            self.assertIsNotNone(user)
+            self.assertEqual(user.name, "Eliud Kirwa")
+            self.assertEqual(user.username, "eliud-kirwa")
+            self.assertFalse(user.is_guest)
+            self.assertEqual(user.country, "Kenya")
+            self.assertEqual(user.preferred_currency, "KES")
+
+    def test_google_login_upgrades_existing_guest_customer(self):
+        email = "guest-checkout@example.com"
+
+        with backend.app.app_context():
+            user = backend.User(
+                name="",
+                username="",
+                email=email,
+                phone="",
+                password_hash=None,
+                role="customer",
+                country="",
+                preferred_currency="",
+                is_guest=True,
+            )
+            backend.db.session.add(user)
+            backend.db.session.commit()
+            guest_user_id = user.id
+
+        profile = {
+            "email": email,
+            "name": "Guest Checkout",
+            "given_name": "Guest",
+            "sub": "google-sub-guest",
+        }
+
+        with mock.patch.object(backend, "verify_google_credential", return_value=profile):
+            response = self.client.post("/auth/google", json={"credential": "fake-google-token"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["user"]["email"], email)
+
+        with backend.app.app_context():
+            user = backend.User.query.get(guest_user_id)
+            self.assertIsNotNone(user)
+            self.assertEqual(user.name, "Guest Checkout")
+            self.assertEqual(user.username, "guest-checkout")
+            self.assertFalse(user.is_guest)
+            self.assertEqual(user.country, "Kenya")
+            self.assertEqual(user.preferred_currency, "KES")
+
+    def test_google_login_returns_json_when_persistence_fails(self):
+        profile = {
+            "email": "failing-google-user@example.com",
+            "name": "Failing User",
+            "given_name": "Failing",
+            "sub": "google-sub-failure",
+        }
+
+        with (
+            mock.patch.object(backend, "verify_google_credential", return_value=profile),
+            mock.patch.object(
+                backend,
+                "get_or_create_google_customer_user",
+                side_effect=backend.SQLAlchemyError("database write failed"),
+            ),
+        ):
+            response = self.client.post("/auth/google", json={"credential": "fake-google-token"})
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.get_json()["message"],
+            "We could not finish Google sign-in right now. Please try again.",
+        )
 
     def test_admin_auth_me_returns_current_admin(self):
         response = self.client.get("/admin/auth/me", headers=self._admin_headers())

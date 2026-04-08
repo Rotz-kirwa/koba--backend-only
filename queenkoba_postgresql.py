@@ -9,8 +9,10 @@ import uuid
 import os
 import base64
 import json
+import re
 from dotenv import load_dotenv
 import requests
+from sqlalchemy.exc import SQLAlchemyError
 
 load_dotenv()
 
@@ -618,6 +620,37 @@ def get_google_allowed_admin_emails():
     emails = [value.strip().lower() for value in raw_values if value.strip()]
     return list(dict.fromkeys(emails))
 
+def normalize_google_display_name(value, fallback=''):
+    candidate = ' '.join(str(value or '').split())
+    if not candidate:
+        candidate = ' '.join(str(fallback or '').split())
+
+    if not candidate:
+        return None
+
+    return candidate[:100]
+
+def build_google_username(email, preferred_value='customer'):
+    email_local_part = str(email or '').split('@')[0].strip().lower()
+    candidates = [preferred_value, email_local_part, 'customer']
+    base_username = 'customer'
+
+    for candidate in candidates:
+        cleaned = re.sub(r'[^a-z0-9._-]+', '-', str(candidate or '').strip().lower()).strip('._-')
+        if cleaned:
+            base_username = cleaned[:80]
+            break
+
+    username = base_username
+    suffix = 1
+
+    while User.query.filter(User.email != email, User.username == username).first():
+        suffix_text = f"-{suffix}"
+        username = f"{base_username[:80 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+
+    return username
+
 def build_customer_user_payload(user):
     return {
         'id': str(user.id),
@@ -718,7 +751,8 @@ def verify_google_credential(credential):
 
 def get_or_create_google_admin_user(profile):
     email = profile['email']
-    name = profile.get('name') or profile.get('given_name') or email.split('@')[0]
+    raw_name = profile.get('name') or profile.get('given_name') or email.split('@')[0]
+    name = normalize_google_display_name(raw_name, email.split('@')[0])
     allowed_emails = get_google_allowed_admin_emails()
     email_is_allowed = email in allowed_emails if allowed_emails else False
 
@@ -731,7 +765,7 @@ def get_or_create_google_admin_user(profile):
         if not user.name:
             user.name = name
         if not user.username:
-            user.username = name
+            user.username = build_google_username(email, raw_name)
         if user.role not in ['admin', 'super_admin'] and email_is_allowed:
             user.role = 'admin'
             user.permissions = user.permissions or ['*']
@@ -744,7 +778,7 @@ def get_or_create_google_admin_user(profile):
 
     user = User(
         name=name,
-        username=name,
+        username=build_google_username(email, raw_name),
         email=email,
         phone='',
         password_hash=bcrypt.hashpw(uuid.uuid4().hex.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
@@ -757,7 +791,8 @@ def get_or_create_google_admin_user(profile):
 
 def get_or_create_google_customer_user(profile):
     email = profile['email']
-    name = profile.get('name') or profile.get('given_name') or email.split('@')[0]
+    raw_name = profile.get('name') or profile.get('given_name') or email.split('@')[0]
+    name = normalize_google_display_name(raw_name, email.split('@')[0])
 
     user = User.query.filter_by(email=email).first()
 
@@ -765,15 +800,21 @@ def get_or_create_google_customer_user(profile):
         if not user.name:
             user.name = name
         if not user.username:
-            user.username = name
+            user.username = build_google_username(email, raw_name)
         if not user.phone:
             user.phone = ''
+        if user.is_guest:
+            user.is_guest = False
+        if not user.country:
+            user.country = 'Kenya'
+        if not user.preferred_currency:
+            user.preferred_currency = 'KES'
         db.session.commit()
         return user, False
 
     user = User(
         name=name,
-        username=name,
+        username=build_google_username(email, raw_name),
         email=email,
         phone='',
         password_hash=bcrypt.hashpw(uuid.uuid4().hex.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
@@ -2420,12 +2461,22 @@ def customer_google_login():
 
     data = request.get_json(silent=True) or {}
     credential = data.get('credential') or data.get('id_token') or data.get('token')
+    profile_email = None
 
     try:
         profile = verify_google_credential(credential)
+        profile_email = profile.get('email')
         user, created = get_or_create_google_customer_user(profile)
     except ValueError as exc:
         return jsonify({'message': str(exc)}), 400
+    except SQLAlchemyError:
+        db.session.rollback()
+        structlog.get_logger().exception('customer_google_login_db_error', email=profile_email)
+        return jsonify({'message': 'We could not finish Google sign-in right now. Please try again.'}), 500
+    except Exception:
+        db.session.rollback()
+        structlog.get_logger().exception('customer_google_login_unexpected_error', email=profile_email)
+        return jsonify({'message': 'We could not finish Google sign-in right now. Please try again.'}), 500
 
     return build_customer_auth_response(user, 201 if created else 200)
 
@@ -2433,14 +2484,24 @@ def customer_google_login():
 def admin_google_login():
     data = request.get_json(silent=True) or {}
     credential = data.get('credential') or data.get('id_token') or data.get('token')
+    profile_email = None
 
     try:
         profile = verify_google_credential(credential)
+        profile_email = profile.get('email')
         user = get_or_create_google_admin_user(profile)
     except ValueError as exc:
         return jsonify({'message': str(exc)}), 400
     except PermissionError as exc:
         return jsonify({'message': str(exc)}), 403
+    except SQLAlchemyError:
+        db.session.rollback()
+        structlog.get_logger().exception('admin_google_login_db_error', email=profile_email)
+        return jsonify({'message': 'We could not finish admin Google sign-in right now. Please try again.'}), 500
+    except Exception:
+        db.session.rollback()
+        structlog.get_logger().exception('admin_google_login_unexpected_error', email=profile_email)
+        return jsonify({'message': 'We could not finish admin Google sign-in right now. Please try again.'}), 500
 
     return build_admin_auth_response(user)
 
