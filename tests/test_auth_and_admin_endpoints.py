@@ -298,6 +298,17 @@ class AuthAndAdminEndpointTests(unittest.TestCase):
             )
             self.assertEqual(callback_response.status_code, 200)
 
+            status_response = self.client.get(
+                f"/payments/mpesa/status/{order_id}",
+                headers=customer_headers,
+            )
+            self.assertEqual(status_response.status_code, 200)
+            status_payload = status_response.get_json()
+            self.assertTrue(status_payload["order_successful"])
+            self.assertIn(order_id, status_payload["message"])
+            self.assertEqual(status_payload["payment"]["payment_status"], "paid")
+            self.assertTrue(status_payload["payment"]["order_successful"])
+
             admin_orders_response = self.client.get(
                 "/admin/orders?payment_status=paid&search=QK12345678",
                 headers=self._admin_headers(),
@@ -326,6 +337,119 @@ class AuthAndAdminEndpointTests(unittest.TestCase):
             self.assertEqual(order["items"][0]["quantity"], 2)
             self.assertTrue(order["paid_at"])
             self.assertEqual(order["shipping_address"]["delivery_point"], "Sarit Centre stage")
+
+            with backend.app.app_context():
+                transaction = backend.PaymentTransaction.query.filter_by(provider_reference="CHK-123").first()
+                self.assertIsNotNone(transaction)
+                self.assertEqual(transaction.phone_number, "254712345678")
+                self.assertEqual(transaction.receipt_number, "QK12345678")
+                self.assertEqual(transaction.status, "success")
+        finally:
+            backend.start_mpesa_stk_push = original_start_mpesa_stk_push
+
+    def test_guest_mpesa_status_can_confirm_success_with_email_and_phone_lookup(self):
+        serum_item = self._catalog_item("Serum", quantity=1)
+
+        original_start_mpesa_stk_push = backend.start_mpesa_stk_push
+
+        def fake_start_mpesa_stk_push(phone_number, amount_kes, order, description='Queen Koba order payment'):
+            return (
+                {
+                    "MerchantRequestID": "MR-GUEST-123",
+                    "CheckoutRequestID": "CHK-GUEST-123",
+                    "CustomerMessage": "STK sent",
+                    "ResponseCode": "0",
+                    "ResponseDescription": "Success",
+                },
+                "254712345678",
+            )
+
+        backend.start_mpesa_stk_push = fake_start_mpesa_stk_push
+
+        try:
+            checkout_response = self.client.post(
+                "/checkout",
+                json={
+                    "items": [serum_item],
+                    "totals": {
+                        "currency": "KES",
+                        "subtotal_kes": serum_item["item_total_kes"],
+                        "shipping_kes": 300,
+                        "grand_total_kes": serum_item["item_total_kes"] + 300,
+                    },
+                    "shipping_address": {
+                        "name": "Guest Customer",
+                        "email": "guest-status@example.com",
+                        "phone": "0712345678",
+                        "address": "Westlands, Sarit Centre stage",
+                        "city": "Nairobi",
+                        "country": "Kenya",
+                        "county": "Nairobi",
+                        "area": "Westlands",
+                        "delivery_zone": "Within Nairobi",
+                        "delivery_zone_code": "nairobi",
+                        "delivery_point": "Sarit Centre stage",
+                        "delivery_method": "door",
+                    },
+                    "payment_method": "mpesa",
+                    "payment_details": {
+                        "type": "mobile",
+                        "phone_number": "0712345678",
+                    },
+                    "delivery": {
+                        "delivery_zone": "Within Nairobi",
+                        "delivery_zone_code": "nairobi",
+                        "county": "Nairobi",
+                        "area": "Westlands",
+                        "point": "Sarit Centre stage",
+                        "delivery_point": "Sarit Centre stage",
+                        "method": "door",
+                        "shipping_fee": 300,
+                        "eta": "Same day / next day",
+                    },
+                },
+            )
+
+            self.assertEqual(checkout_response.status_code, 200)
+            order_id = checkout_response.get_json()["order_id"]
+
+            callback_response = self.client.post(
+                "/payments/mpesa/callback",
+                json={
+                    "Body": {
+                        "stkCallback": {
+                            "CheckoutRequestID": "CHK-GUEST-123",
+                            "ResultCode": 0,
+                            "ResultDesc": "The service request is processed successfully.",
+                            "CallbackMetadata": {
+                                "Item": [
+                                    {"Name": "Amount", "Value": float(serum_item["item_total_kes"]) + 300},
+                                    {"Name": "MpesaReceiptNumber", "Value": "QKGUEST123"},
+                                    {"Name": "TransactionDate", "Value": 20260327103045},
+                                    {"Name": "PhoneNumber", "Value": 254712345678},
+                                ]
+                            },
+                        }
+                    }
+                },
+            )
+            self.assertEqual(callback_response.status_code, 200)
+
+            status_response = self.client.get(
+                f"/payments/mpesa/status/{order_id}",
+                query_string={
+                    "email": "guest-status@example.com",
+                    "phone": "0712345678",
+                },
+            )
+
+            self.assertEqual(status_response.status_code, 200)
+            payload = status_response.get_json()
+            self.assertTrue(payload["order_successful"])
+            self.assertIn(order_id, payload["message"])
+            self.assertEqual(payload["payment"]["payment_status"], "paid")
+            self.assertTrue(payload["payment"]["order_successful"])
+            self.assertEqual(payload["payment"]["phone_number"], 254712345678)
         finally:
             backend.start_mpesa_stk_push = original_start_mpesa_stk_push
 

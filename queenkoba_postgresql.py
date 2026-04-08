@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity, verify_jwt_in_request
@@ -16,7 +16,38 @@ load_dotenv()
 
 DEFAULT_GOOGLE_CLIENT_ID = '445338583811-0gknu3ni8fn9mh3pa874agtu61i29tvr.apps.googleusercontent.com'
 
+import structlog
+import sentry_sdk
+from sentry_sdk.integrations.flask import FlaskIntegration
+
+sentry_sdk.init(
+    dsn=os.environ.get("SENTRY_DSN", ""),
+    integrations=[FlaskIntegration()],
+    traces_sample_rate=1.0,
+    environment=os.environ.get("FLASK_ENV", "production")
+)
+
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.JSONRenderer()
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+)
+
 app = Flask(__name__)
+
+@app.before_request
+def before_request():
+    g.request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(
+        request_id=g.request_id,
+        path=request.path,
+        method=request.method,
+        client_ip=request.remote_addr
+    )
 
 # CORS Configuration - Allow frontend and admin URLs
 allowed_origins = [
@@ -25,6 +56,9 @@ allowed_origins = [
     "http://localhost:5174",
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
     "http://127.0.0.1:5173",
     "http://127.0.0.1:5174",
     os.getenv('FRONTEND_URL', ''),
@@ -66,11 +100,12 @@ def initialize_database():
 class User(db.Model):
     __tablename__ = 'users'
     id = db.Column(db.Integer, primary_key=True)
+    is_guest = db.Column(db.Boolean, default=False)
     name = db.Column(db.String(100))
     username = db.Column(db.String(80))
     email = db.Column(db.String(120), unique=True, nullable=False)
     phone = db.Column(db.String(20))
-    password_hash = db.Column(db.String(255), nullable=False)
+    password_hash = db.Column(db.String(255), nullable=True)
     role = db.Column(db.String(20), default='customer')
     country = db.Column(db.String(50), default='Kenya')
     preferred_currency = db.Column(db.String(10), default='KES')
@@ -128,6 +163,28 @@ class Order(db.Model):
     final_total_after_discount = db.Column(db.Float, default=0)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class PaymentTransaction(db.Model):
+    __tablename__ = 'payment_transactions'
+    id = db.Column(db.Integer, primary_key=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=False)
+    provider = db.Column(db.String(50), default='mpesa', nullable=False)
+    provider_reference = db.Column(db.String(100), unique=True, nullable=False, index=True)
+    merchant_request_id = db.Column(db.String(100), nullable=True, index=True)
+    receipt_number = db.Column(db.String(100), unique=True, nullable=True, index=True)
+    account_reference = db.Column(db.String(100), nullable=True)
+    phone_number = db.Column(db.String(20), nullable=False)
+    amount = db.Column(db.Float, nullable=False)
+    status = db.Column(db.String(50), default='initiated', nullable=False)
+    result_code = db.Column(db.String(20), nullable=True)
+    result_desc = db.Column(db.Text, nullable=True)
+    transaction_date = db.Column(db.DateTime, nullable=True)
+    raw_response = db.Column(db.JSON)
+    callback_payload = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    order = db.relationship('Order', backref=db.backref('payment_transactions', lazy=True))
 
 class Promotion(db.Model):
     __tablename__ = 'promotions'
@@ -236,6 +293,63 @@ class SiteContent(db.Model):
     value = db.Column(db.Text)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+class AnalyticsEvent(db.Model):
+    __tablename__ = 'analytics_events'
+    id = db.Column(db.Integer, primary_key=True)
+    event_type = db.Column(db.String(50), nullable=False)  # 'page_view', 'order', 'user_registration', etc.
+    event_data = db.Column(db.JSON, nullable=False)  # Store event-specific data
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    session_id = db.Column(db.String(100), nullable=True)
+    ip_address = db.Column(db.String(45), nullable=True)
+    user_agent = db.Column(db.Text, nullable=True)
+    referrer = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    user = db.relationship('User')
+
+class DailyAnalytics(db.Model):
+    __tablename__ = 'daily_analytics'
+    id = db.Column(db.Integer, primary_key=True)
+    date = db.Column(db.Date, nullable=False, unique=True, index=True)
+    page_views = db.Column(db.Integer, default=0)
+    unique_visitors = db.Column(db.Integer, default=0)
+    orders_count = db.Column(db.Integer, default=0)
+    revenue_kes = db.Column(db.Float, default=0.0)
+    new_customers = db.Column(db.Integer, default=0)
+    conversion_rate = db.Column(db.Float, default=0.0)
+    avg_order_value_kes = db.Column(db.Float, default=0.0)
+    top_traffic_source = db.Column(db.String(50), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class TrafficSource(db.Model):
+    __tablename__ = 'traffic_sources'
+    id = db.Column(db.Integer, primary_key=True)
+    source = db.Column(db.String(50), nullable=False, unique=True)  # 'direct', 'google', 'instagram', etc.
+    display_name = db.Column(db.String(100), nullable=False)
+    visits_count = db.Column(db.Integer, default=0)
+    orders_count = db.Column(db.Integer, default=0)
+    revenue_kes = db.Column(db.Float, default=0.0)
+    last_updated = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+class ActivityLog(db.Model):
+    __tablename__ = 'activity_logs'
+    id = db.Column(db.Integer, primary_key=True)
+    activity_type = db.Column(db.String(50), nullable=False)  # 'order_placed', 'user_registered', 'payment_completed', etc.
+    description = db.Column(db.Text, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    admin_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    order_id = db.Column(db.Integer, db.ForeignKey('orders.id'), nullable=True)
+    product_id = db.Column(db.Integer, db.ForeignKey('products.id'), nullable=True)
+    event_data = db.Column(db.JSON, nullable=True)  # Additional data (renamed from metadata to avoid SQLAlchemy conflicts)
+    ip_address = db.Column(db.String(45), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    user = db.relationship('User', foreign_keys=[user_id])
+    admin = db.relationship('User', foreign_keys=[admin_id])
+    order = db.relationship('Order')
+    product = db.relationship('Product')
+
 # ========== HELPER FUNCTIONS ==========
 def ensure_schema_updates():
     inspector = db.inspect(db.engine)
@@ -315,7 +429,10 @@ def now_utc():
 def parse_int(value, default=None):
     if value in (None, '', False):
         return default
-    return int(value)
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
 
 def parse_float(value, default=0):
     if value in (None, '', False):
@@ -457,13 +574,22 @@ def get_mpesa_access_token():
 
     credentials = f"{config['consumer_key']}:{config['consumer_secret']}"
     encoded = base64.b64encode(credentials.encode('utf-8')).decode('utf-8')
-    response = requests.get(
-        f"{get_mpesa_base_url()}/oauth/v1/generate?grant_type=client_credentials",
-        headers={'Authorization': f"Basic {encoded}"},
-        timeout=config['timeout_seconds'],
-    )
-    response.raise_for_status()
-    data = response.json()
+
+    try:
+        response = requests.get(
+            f"{get_mpesa_base_url()}/oauth/v1/generate?grant_type=client_credentials",
+            headers={'Authorization': f"Basic {encoded}"},
+            timeout=config['timeout_seconds'],
+        )
+        response.raise_for_status()
+        data = response.json()
+    except requests.Timeout as exc:
+        raise ValueError('M-Pesa authentication timed out. Please try again later.') from exc
+    except requests.RequestException as exc:
+        raise ValueError('Unable to authenticate with M-Pesa. Please verify configuration.') from exc
+    except ValueError as exc:
+        raise ValueError('Invalid response when authenticating with M-Pesa.') from exc
+
     token = data.get('access_token')
     if not token:
         raise ValueError('Safaricom OAuth token missing from response')
@@ -1021,9 +1147,10 @@ def resolve_order_items_for_promo_request(user, data):
     raise ValueError('Add items to your cart before applying a promo code')
 
 def resolve_order_items_for_checkout(user_id, data):
-    cart_items = CartItem.query.filter_by(user_id=user_id).all()
-    if cart_items:
-        return [build_cart_item_payload(item) for item in cart_items]
+    if user_id:
+        cart_items = CartItem.query.filter_by(user_id=user_id).all()
+        if cart_items:
+            return [build_cart_item_payload(item) for item in cart_items]
 
     payload_items = build_checkout_items_from_payload(data.get('items') or [])
     if payload_items:
@@ -1768,18 +1895,100 @@ def extract_mpesa_callback_metadata(callback_metadata):
             metadata[name] = item.get('Value')
     return metadata
 
+def normalize_status_lookup_phone(value):
+    digits = ''.join(char for char in str(value or '') if char.isdigit())
+    if not digits:
+        return None
+    if digits.startswith('254') and len(digits) == 12:
+        return digits
+    if digits.startswith('0') and len(digits) == 10:
+        return f"254{digits[1:]}"
+    if len(digits) == 9 and digits[0] in {'7', '1'}:
+        return f"254{digits}"
+    return digits
+
+def build_mpesa_customer_message(order, payment_status, state):
+    if payment_status == 'paid':
+        return f"Payment confirmed. Your order {order.order_id} was placed successfully."
+
+    if payment_status == 'failed':
+        result_desc = state.get('result_desc')
+        if result_desc:
+            return f"M-Pesa payment failed for order {order.order_id}: {result_desc}"
+        return f"M-Pesa payment failed for order {order.order_id}. Please try again."
+
+    pending_message = state.get('customer_message')
+    if pending_message:
+        return pending_message
+
+    if state.get('query_error'):
+        return (
+            f"We are still waiting for M-Pesa confirmation for order {order.order_id}. "
+            "If you completed the prompt, keep this page open and try again shortly."
+        )
+
+    return (
+        f"Complete the M-Pesa prompt on your phone to finish order {order.order_id}."
+    )
+
+def order_matches_status_lookup(order, email=None, phone=None):
+    state = get_order_payment_state(order)
+    shipping_address = order.shipping_address or {}
+    customer = state.get('customer', {}) if isinstance(state, dict) else {}
+    state_phone = state.get('phone_number') if isinstance(state, dict) else None
+
+    candidate_emails = {
+        normalize_delivery_text(customer.get('email')).lower(),
+        normalize_delivery_text(shipping_address.get('email')).lower(),
+        normalize_delivery_text(order.user.email if order.user else None).lower(),
+    }
+    candidate_emails.discard('')
+
+    candidate_phones = {
+        normalize_status_lookup_phone(customer.get('phone')),
+        normalize_status_lookup_phone(shipping_address.get('phone')),
+        normalize_status_lookup_phone(state_phone),
+        normalize_status_lookup_phone(order.user.phone if order.user else None),
+    }
+    candidate_phones.discard(None)
+
+    if email and email not in candidate_emails:
+        return False
+
+    if phone and phone not in candidate_phones:
+        return False
+
+    return True
+
+def find_mpesa_order_for_status_check(order_ref, user_id=None, email=None, phone=None):
+    if user_id is not None:
+        return Order.query.filter_by(order_id=order_ref, user_id=user_id).first()
+
+    order = Order.query.filter_by(order_id=order_ref).first()
+    if not order:
+        return None
+
+    if not email and not phone:
+        return None
+
+    return order if order_matches_status_lookup(order, email=email, phone=phone) else None
+
 def build_mpesa_status_response(order):
     state = get_order_payment_state(order)
+    payment_status = resolve_payment_status(order, state)
+    customer_message = build_mpesa_customer_message(order, payment_status, state)
     return {
         'order_id': order.order_id,
         'payment_method': order.payment_method,
-        'payment_status': order.payment_status,
+        'payment_status': payment_status,
         'order_status': order.order_status,
         'checkout_request_id': state.get('checkout_request_id'),
         'merchant_request_id': state.get('merchant_request_id'),
         'result_code': state.get('result_code'),
         'result_desc': state.get('result_desc'),
-        'customer_message': state.get('customer_message'),
+        'customer_message': customer_message,
+        'status_message': customer_message,
+        'order_successful': payment_status == 'paid',
         'receipt_number': state.get('receipt_number'),
         'phone_number': state.get('phone_number'),
         'amount_kes': state.get('amount_kes'),
@@ -2336,11 +2545,34 @@ def clear_cart():
     return jsonify({'status': 'success', 'message': 'Cart cleared'})
 
 @app.route('/checkout', methods=['POST'])
-@jwt_required()
+@jwt_required(optional=True)
 def checkout():
-    user_id = int(get_jwt_identity())
+    user_id_from_jwt = get_jwt_identity()
     data = request.get_json() or {}
-    user = User.query.get(user_id)
+    
+    if user_id_from_jwt:
+        user_id = int(user_id_from_jwt)
+        user = User.query.get(user_id)
+    else:
+        email = data.get('shipping_address', {}).get('email') or data.get('email')
+        phone = data.get('shipping_address', {}).get('phone') or data.get('phone')
+        name = data.get('shipping_address', {}).get('name') or data.get('name') or 'Guest'
+        
+        if not email:
+            return jsonify({'message': 'Email address is required for checkout'}), 400
+            
+        user = User.query.filter_by(email=email).first()
+        if not user:
+            user = User(
+                is_guest=True,
+                email=email,
+                phone=phone,
+                name=name,
+                username=f"guest_{int(datetime.utcnow().timestamp())}"
+            )
+            db.session.add(user)
+            db.session.commit()
+        user_id = user.id
 
     try:
         shipping_address, delivery_payload, shipping_kes = build_validated_delivery_payload(data)
@@ -2455,10 +2687,29 @@ def checkout():
         )
         order.payment_status = 'initiated'
         order.order_status = 'processing'
+
+        tx = PaymentTransaction(
+            order_id=order.id,
+            provider='mpesa',
+            provider_reference=stk_response.get('CheckoutRequestID'),
+            merchant_request_id=stk_response.get('MerchantRequestID'),
+            account_reference=order.order_id,
+            phone_number=normalized_phone,
+            amount=int(round(grand_total_kes)),
+            status='pending',
+            raw_response=stk_response
+        )
+        db.session.add(tx)
+
         db.session.commit()
 
         return jsonify({
             'status': 'success',
+            'message': (
+                f"M-Pesa prompt sent to {normalized_phone}. Complete the payment on your phone "
+                f"to confirm order {order.order_id}."
+            ),
+            'order_successful': False,
             'order_id': order.order_id,
             'total': total_usd,
             'payment': {
@@ -2483,6 +2734,8 @@ def checkout():
 
     return jsonify({
         'status': 'success',
+        'message': f"Order {order.order_id} placed successfully.",
+        'order_successful': True,
         'order_id': order.order_id,
         'total': total_usd,
         'promo': promo_summary,
@@ -2490,20 +2743,30 @@ def checkout():
 
 @app.route('/payments/mpesa/callback', methods=['POST'])
 def mpesa_callback():
+    log = structlog.get_logger()
     data = request.get_json(silent=True) or {}
     callback = (
         data.get('Body', {})
         .get('stkCallback', {})
     )
     checkout_request_id = callback.get('CheckoutRequestID')
+    log.info('mpesa_callback_received', checkout_request_id=checkout_request_id)
     order = find_order_by_checkout_request_id(checkout_request_id)
 
     if order:
         result_code = callback.get('ResultCode')
         result_desc = callback.get('ResultDesc')
+        payment_succeeded = str(result_code) == '0'
         metadata = extract_mpesa_callback_metadata(callback.get('CallbackMetadata', {}))
         transaction_datetime = parse_payment_datetime_value(metadata.get('TransactionDate'))
         confirmed_at = now_utc().isoformat()
+        amount_kes = metadata.get('Amount') or get_order_payment_state(order).get('amount_kes')
+        resolved_phone_number = metadata.get('PhoneNumber') or get_order_payment_state(order).get('phone_number')
+        customer_message = (
+            f"Payment confirmed. Your order {order.order_id} was placed successfully."
+            if payment_succeeded
+            else f"M-Pesa payment failed for order {order.order_id}: {result_desc}"
+        )
 
         set_order_payment_state(
             order,
@@ -2519,12 +2782,17 @@ def mpesa_callback():
                 if result_code == 0 and transaction_datetime
                 else confirmed_at if result_code == 0 else get_order_payment_state(order).get('paid_at')
             ),
-            amount_kes=metadata.get('Amount') or get_order_payment_state(order).get('amount_kes'),
-            phone_number=metadata.get('PhoneNumber') or get_order_payment_state(order).get('phone_number'),
+            amount_kes=amount_kes,
+            phone_number=resolved_phone_number,
+            customer_message=customer_message,
             callback_payload=data,
         )
-        order.payment_status = 'paid' if result_code == 0 else 'failed'
-        order.order_status = 'processing' if result_code == 0 else 'payment_failed'
+        order.payment_status = 'paid' if payment_succeeded else 'failed'
+        order.order_status = 'processing' if payment_succeeded else 'payment_failed'
+        if payment_succeeded:
+            log.info('mpesa_payment_confirmed', order_id=order.order_id, receipt=metadata.get('MpesaReceiptNumber'))
+        else:
+            log.warning('mpesa_payment_failed', order_id=order.order_id, result_code=result_code, result_desc=result_desc)
         append_order_event(
             order,
             event_type='mpesa_callback_received',
@@ -2536,18 +2804,58 @@ def mpesa_callback():
                 'receipt_number': metadata.get('MpesaReceiptNumber'),
             },
         )
-        if result_code == 0:
+        if payment_succeeded:
             clear_user_cart_items(order.user_id)
             record_promotion_usage_for_order(order)
+
+        transaction = PaymentTransaction.query.filter_by(provider_reference=checkout_request_id).first()
+        if not transaction and checkout_request_id and resolved_phone_number and amount_kes is not None:
+            transaction = PaymentTransaction(
+                order_id=order.id,
+                provider='mpesa',
+                provider_reference=checkout_request_id,
+                merchant_request_id=get_order_payment_state(order).get('merchant_request_id'),
+                account_reference=order.order_id,
+                phone_number=str(resolved_phone_number),
+                amount=float(amount_kes),
+                status='success' if payment_succeeded else 'failed',
+                raw_response=get_order_payment_state(order).get('raw_response'),
+            )
+            db.session.add(transaction)
+
+        if transaction:
+            if resolved_phone_number:
+                transaction.phone_number = str(resolved_phone_number)
+            if amount_kes is not None:
+                transaction.amount = float(amount_kes)
+            transaction.merchant_request_id = transaction.merchant_request_id or get_order_payment_state(order).get('merchant_request_id')
+            transaction.account_reference = transaction.account_reference or order.order_id
+            transaction.receipt_number = metadata.get('MpesaReceiptNumber') or transaction.receipt_number
+            transaction.result_code = str(result_code) if result_code is not None else transaction.result_code
+            transaction.result_desc = result_desc or transaction.result_desc
+            transaction.transaction_date = transaction_datetime or transaction.transaction_date
+            transaction.status = 'success' if payment_succeeded else 'failed'
+            transaction.callback_payload = data
+            transaction.updated_at = datetime.utcnow()
+
         db.session.commit()
 
     return jsonify({'ResultCode': 0, 'ResultDesc': 'Accepted'})
 
 @app.route('/payments/mpesa/status/<string:order_ref>', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def mpesa_status(order_ref):
-    user_id = int(get_jwt_identity())
-    order = Order.query.filter_by(order_id=order_ref, user_id=user_id).first()
+    user_id_raw = get_jwt_identity()
+    user_id = int(user_id_raw) if user_id_raw is not None else None
+    email = normalize_delivery_text(request.args.get('email')).lower()
+    phone = normalize_status_lookup_phone(request.args.get('phone'))
+
+    if user_id is None and not email and not phone:
+        return jsonify({
+            'message': 'Sign in or provide the checkout email or phone number to check this M-Pesa payment.',
+        }), 401
+
+    order = find_mpesa_order_for_status_check(order_ref, user_id=user_id, email=email or None, phone=phone)
     if not order:
         return jsonify({'message': 'Order not found'}), 404
 
@@ -2555,12 +2863,24 @@ def mpesa_status(order_ref):
         return jsonify({'message': 'Order is not an M-Pesa payment'}), 400
 
     if order.payment_status in ['paid', 'failed']:
-        return jsonify({'status': 'success', 'payment': build_mpesa_status_response(order)})
+        payment = build_mpesa_status_response(order)
+        return jsonify({
+            'status': 'success',
+            'message': payment['status_message'],
+            'order_successful': payment['order_successful'],
+            'payment': payment,
+        })
 
     state = get_order_payment_state(order)
     checkout_request_id = state.get('checkout_request_id')
     if not checkout_request_id:
-        return jsonify({'status': 'success', 'payment': build_mpesa_status_response(order)})
+        payment = build_mpesa_status_response(order)
+        return jsonify({
+            'status': 'success',
+            'message': payment['status_message'],
+            'order_successful': payment['order_successful'],
+            'payment': payment,
+        })
 
     try:
         query_response = query_mpesa_stk_status(checkout_request_id)
@@ -2580,18 +2900,22 @@ def mpesa_status(order_ref):
             metadata={'details': response_text},
         )
         db.session.commit()
+        payment = build_mpesa_status_response(order)
         return jsonify({
             'status': 'success',
-            'payment': build_mpesa_status_response(order),
+            'message': payment['status_message'],
+            'order_successful': payment['order_successful'],
+            'payment': payment,
         })
 
     result_code_raw = query_response.get('ResultCode')
     result_code = int(result_code_raw) if str(result_code_raw).isdigit() else result_code_raw
     result_desc = query_response.get('ResultDesc')
+    payment_succeeded = result_code == 0
     if result_code == 0:
         order.payment_status = 'paid'
         order.order_status = 'processing'
-        clear_user_cart_items(user_id)
+        clear_user_cart_items(order.user_id)
         record_promotion_usage_for_order(order)
     elif result_code in [1032, 1037, 2001, 1]:
         order.payment_status = 'failed'
@@ -2606,6 +2930,13 @@ def mpesa_status(order_ref):
         payment_provider='mpesa',
         payment_confirmed_at=now_utc().isoformat() if result_code == 0 else state.get('payment_confirmed_at'),
         paid_at=now_utc().isoformat() if result_code == 0 else state.get('paid_at'),
+        customer_message=(
+            f"Payment confirmed. Your order {order.order_id} was placed successfully."
+            if payment_succeeded
+            else f"M-Pesa payment failed for order {order.order_id}: {result_desc}"
+            if result_code in [1032, 1037, 2001, 1]
+            else state.get('customer_message')
+        ),
     )
     if result_code == 0:
         append_order_event(
@@ -2623,9 +2954,44 @@ def mpesa_status(order_ref):
             message=f"M-Pesa status query reported failure: {result_desc}",
             metadata={'result_code': result_code, 'result_desc': result_desc},
         )
-    db.session.commit()
 
-    return jsonify({'status': 'success', 'payment': build_mpesa_status_response(order)})
+    resolved_phone_number = state.get('phone_number')
+    amount_kes = state.get('amount_kes')
+    transaction = PaymentTransaction.query.filter_by(provider_reference=checkout_request_id).first()
+    if not transaction and checkout_request_id and resolved_phone_number and amount_kes is not None:
+        transaction = PaymentTransaction(
+            order_id=order.id,
+            provider='mpesa',
+            provider_reference=checkout_request_id,
+            merchant_request_id=state.get('merchant_request_id'),
+            account_reference=order.order_id,
+            phone_number=str(resolved_phone_number),
+            amount=float(amount_kes),
+            status='success' if payment_succeeded else 'failed' if result_code in [1032, 1037, 2001, 1] else 'pending',
+            raw_response=query_response,
+        )
+        db.session.add(transaction)
+
+    if transaction:
+        transaction.status = 'success' if payment_succeeded else 'failed' if result_code in [1032, 1037, 2001, 1] else transaction.status
+        transaction.result_code = str(result_code) if result_code is not None else transaction.result_code
+        transaction.result_desc = result_desc or transaction.result_desc
+        if resolved_phone_number:
+            transaction.phone_number = str(resolved_phone_number)
+        if amount_kes is not None:
+            transaction.amount = float(amount_kes)
+        transaction.raw_response = query_response
+        transaction.updated_at = datetime.utcnow()
+
+    db.session.commit()
+    payment = build_mpesa_status_response(order)
+
+    return jsonify({
+        'status': 'success',
+        'message': payment['status_message'],
+        'order_successful': payment['order_successful'],
+        'payment': payment,
+    })
 
 @app.route('/orders', methods=['GET'])
 @jwt_required()
@@ -3455,6 +3821,8 @@ def public_content():
         }
 
     return jsonify({'content': content, 'lite': lite})
+
+# ========== ADMIN MANAGEMENT ENDPOINTS ==========
 
 @app.route('/admin/admins', methods=['GET'])
 @admin_required()
