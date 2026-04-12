@@ -228,6 +228,87 @@ class AuthAndAdminEndpointTests(unittest.TestCase):
         self.assertIn("summary", analytics)
         self.assertIn("top_products", analytics)
 
+    def test_analytics_track_persists_event(self):
+        response = self.client.post(
+            "/analytics/track",
+            json={
+                "event_type": "page_view",
+                "event_data": {
+                    "message": "Viewed the homepage",
+                    "path": "/",
+                    "source": "direct",
+                },
+                "session_id": "session-123",
+            },
+        )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()
+        self.assertEqual(payload["event"]["event_type"], "page_view")
+
+        with backend.app.app_context():
+            event = backend.AnalyticsEvent.query.one()
+            self.assertEqual(event.session_id, "session-123")
+            self.assertEqual(event.event_data["path"], "/")
+            self.assertEqual(event.event_data["source"], "direct")
+
+    def test_admin_activity_inventory_and_customer_analytics_routes_return_expected_shape(self):
+        self._create_customer()
+
+        with backend.app.app_context():
+            product = backend.Product.query.first()
+            self.assertIsNotNone(product)
+            product.in_stock = False
+            backend.db.session.commit()
+
+        track_response = self.client.post(
+            "/analytics/track",
+            json={
+                "event_type": "checkout_started",
+                "event_data": {
+                    "message": "A customer started checkout.",
+                    "source": "shop",
+                },
+            },
+        )
+        self.assertEqual(track_response.status_code, 201)
+
+        activity_response = self.client.get(
+            "/admin/analytics/activity?limit=5",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(activity_response.status_code, 200)
+        activity_payload = activity_response.get_json()
+        self.assertIn("activities", activity_payload)
+        self.assertGreaterEqual(len(activity_payload["activities"]), 1)
+        self.assertTrue(
+            any(
+                activity["type"] in {"checkout_started", "customer_registered"}
+                for activity in activity_payload["activities"]
+            )
+        )
+
+        inventory_response = self.client.get(
+            "/admin/analytics/inventory",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(inventory_response.status_code, 200)
+        inventory = inventory_response.get_json()["inventory"]
+        self.assertIn("summary", inventory)
+        self.assertIn("restock_items", inventory)
+        self.assertGreaterEqual(inventory["summary"]["out_of_stock"], 1)
+
+        customer_response = self.client.get(
+            "/admin/analytics/customers?days=30",
+            headers=self._admin_headers(),
+        )
+        self.assertEqual(customer_response.status_code, 200)
+        customers = customer_response.get_json()["customers"]
+        self.assertIn("summary", customers)
+        self.assertIn("growth", customers)
+        self.assertIn("locations", customers)
+        self.assertGreaterEqual(customers["summary"]["total_customers"], 1)
+
     def test_public_products_and_content_support_lite_mode(self):
         products_response = self.client.get("/products?lite=true&limit=3")
         self.assertEqual(products_response.status_code, 200)

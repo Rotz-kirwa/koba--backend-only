@@ -1659,6 +1659,250 @@ def build_admin_analytics_payload():
         ],
     }
 
+def humanize_identifier(value, fallback='Unknown'):
+    text = normalize_delivery_text(value).replace('_', ' ').replace('-', ' ')
+    if not text:
+        return fallback
+    return ' '.join(word.capitalize() for word in text.split())
+
+def safe_parse_datetime(value, fallback=None):
+    try:
+        return parse_datetime_value(value) or fallback
+    except (TypeError, ValueError):
+        return fallback
+
+def infer_activity_style(event_type):
+    normalized = normalize_category_name(event_type)
+
+    if any(token in normalized for token in ['failed', 'error', 'cancel', 'reject']):
+        return 'error', 'AlertTriangle'
+    if any(token in normalized for token in ['paid', 'success', 'confirmed', 'complete']):
+        return 'success', 'CreditCard'
+    if any(token in normalized for token in ['delivery', 'shipping', 'dispatch', 'truck']):
+        return 'info', 'Truck'
+    if any(token in normalized for token in ['inventory', 'product', 'restock', 'stock']):
+        return 'warning', 'Package'
+    if any(token in normalized for token in ['customer', 'user', 'signup', 'register']):
+        return 'info', 'User'
+
+    return 'warning', 'ShoppingBag'
+
+def build_admin_activity_feed(limit=20):
+    activities = []
+    sample_size = max(limit * 2, 20)
+
+    recent_orders = Order.query.order_by(Order.created_at.desc()).limit(sample_size).all()
+    for order in recent_orders:
+        payload = build_admin_order_payload(order)
+        last_event = payload.get('last_event') or {}
+        timestamp = safe_parse_datetime(last_event.get('created_at'), order.created_at or now_utc())
+        payment_status = str(payload.get('payment_status') or '').lower()
+        if payment_status == 'paid':
+            status, icon = 'success', 'CreditCard'
+        elif payment_status == 'failed':
+            status, icon = 'error', 'AlertTriangle'
+        else:
+            status, icon = 'warning', 'ShoppingBag'
+
+        activities.append({
+            'id': int(order.id),
+            'type': str(last_event.get('type') or 'order'),
+            'message': (
+                last_event.get('message')
+                or f"{payload.get('customer_name') or 'Guest customer'} placed order {payload.get('order_id') or order.id}."
+            ),
+            'timestamp': serialize_datetime(timestamp),
+            'status': status,
+            'icon': icon,
+            '_sort_at': timestamp or now_utc(),
+        })
+
+    recent_customers = User.query.filter_by(role='customer').order_by(User.created_at.desc()).limit(sample_size).all()
+    for customer in recent_customers:
+        timestamp = customer.created_at or now_utc()
+        activities.append({
+            'id': 100000 + int(customer.id),
+            'type': 'customer_registered',
+            'message': f"{customer.name or customer.username or customer.email or 'A customer'} joined the store.",
+            'timestamp': serialize_datetime(timestamp),
+            'status': 'info',
+            'icon': 'User',
+            '_sort_at': timestamp,
+        })
+
+    recent_events = AnalyticsEvent.query.order_by(AnalyticsEvent.created_at.desc()).limit(sample_size).all()
+    for event in recent_events:
+        event_payload = event.event_data if isinstance(event.event_data, dict) else {}
+        status, icon = infer_activity_style(event.event_type)
+        source = humanize_identifier(event_payload.get('source') or event_payload.get('channel'), fallback='Direct')
+        message = normalize_delivery_text(event_payload.get('message'))
+        if not message:
+            message = f"Tracked {humanize_identifier(event.event_type)} event"
+            if source:
+                message = f"{message} from {source}."
+
+        activities.append({
+            'id': 200000 + int(event.id),
+            'type': event.event_type,
+            'message': message,
+            'timestamp': serialize_datetime(event.created_at),
+            'status': status if status != 'warning' else 'info',
+            'icon': icon if icon != 'ShoppingBag' else 'Package',
+            '_sort_at': event.created_at or now_utc(),
+        })
+
+    recent_logs = ActivityLog.query.order_by(ActivityLog.created_at.desc()).limit(sample_size).all()
+    for entry in recent_logs:
+        status, icon = infer_activity_style(entry.activity_type)
+        activities.append({
+            'id': 300000 + int(entry.id),
+            'type': entry.activity_type,
+            'message': entry.description,
+            'timestamp': serialize_datetime(entry.created_at),
+            'status': status,
+            'icon': icon,
+            '_sort_at': entry.created_at or now_utc(),
+        })
+
+    activities.sort(key=lambda item: item['_sort_at'], reverse=True)
+    trimmed = activities[:limit]
+    for item in trimmed:
+        item.pop('_sort_at', None)
+    return trimmed
+
+def build_inventory_analytics_payload():
+    products = Product.query.order_by(Product.category.asc(), Product.name.asc()).all()
+    total_products = len(products)
+    in_stock_products = [product for product in products if bool(product.in_stock)]
+    out_of_stock_products = [product for product in products if not bool(product.in_stock)]
+
+    category_map = {}
+    for product in products:
+        category = product.category or 'Other'
+        bucket = category_map.setdefault(category, {
+            'category': category,
+            'products': 0,
+            'in_stock': 0,
+            'out_of_stock': 0,
+        })
+        bucket['products'] += 1
+        if product.in_stock:
+            bucket['in_stock'] += 1
+        else:
+            bucket['out_of_stock'] += 1
+
+    return {
+        'summary': {
+            'total_products': total_products,
+            'in_stock': len(in_stock_products),
+            'out_of_stock': len(out_of_stock_products),
+            'low_stock': len(out_of_stock_products),
+            'stock_health_percent': round((len(in_stock_products) / total_products) * 100, 1) if total_products else 0,
+            'categories_count': len(category_map),
+        },
+        'restock_items': [
+            {
+                'id': str(product.id),
+                'name': product.name,
+                'category': product.category or 'Other',
+                'in_stock': bool(product.in_stock),
+                'updated_at': serialize_datetime(product.updated_at or product.created_at),
+            }
+            for product in out_of_stock_products[:10]
+        ],
+        'categories': sorted(category_map.values(), key=lambda item: (-item['out_of_stock'], item['category'])),
+    }
+
+def build_customer_analytics_payload(days=30):
+    days = max(1, min(int(days or 30), 365))
+    now = now_utc()
+    start_at = now - timedelta(days=days - 1)
+    start_at = datetime(start_at.year, start_at.month, start_at.day)
+
+    customers = User.query.filter_by(role='customer').order_by(User.created_at.desc()).all()
+    orders = Order.query.order_by(Order.created_at.desc()).all()
+
+    orders_by_user = {}
+    spent_by_user = {}
+    active_customer_ids = set()
+
+    for order in orders:
+        orders_by_user.setdefault(order.user_id, []).append(order)
+        if order.created_at and order.created_at >= start_at:
+            active_customer_ids.add(order.user_id)
+
+        payload = build_admin_order_payload(order)
+        if payload.get('payment_status') == 'paid':
+            spent_by_user[order.user_id] = spent_by_user.get(order.user_id, 0.0) + float(payload.get('grand_total_kes', 0) or 0)
+
+    growth_map = {}
+    cursor = start_at
+    while cursor.date() <= now.date():
+        key = cursor.strftime('%Y-%m-%d')
+        growth_map[key] = {
+            'date': key,
+            'label': cursor.strftime('%b %d'),
+            'new_customers': 0,
+        }
+        cursor += timedelta(days=1)
+
+    for customer in customers:
+        if customer.created_at and customer.created_at >= start_at:
+            key = customer.created_at.strftime('%Y-%m-%d')
+            if key in growth_map:
+                growth_map[key]['new_customers'] += 1
+
+    total_customers = len(customers)
+    new_customers = sum(1 for customer in customers if customer.created_at and customer.created_at >= start_at)
+    repeat_customers = sum(1 for customer in customers if len(orders_by_user.get(customer.id, [])) > 1)
+
+    location_counts = {}
+    for customer in customers:
+        country = customer.country or 'Kenya'
+        location_counts[country] = location_counts.get(country, 0) + 1
+
+    top_customers = sorted(
+        [
+            {
+                'id': str(customer.id),
+                'name': customer.name or customer.username or customer.email,
+                'email': customer.email,
+                'country': customer.country or 'Kenya',
+                'orders_count': len(orders_by_user.get(customer.id, [])),
+                'total_spent_kes': round(spent_by_user.get(customer.id, 0.0), 2),
+            }
+            for customer in customers
+        ],
+        key=lambda item: (item['total_spent_kes'], item['orders_count']),
+        reverse=True,
+    )[:10]
+
+    locations = sorted(
+        [
+            {
+                'country': country,
+                'count': count,
+                'percentage': round((count / total_customers) * 100, 1) if total_customers else 0,
+            }
+            for country, count in location_counts.items()
+        ],
+        key=lambda item: (-item['count'], item['country']),
+    )[:10]
+
+    return {
+        'summary': {
+            'period_days': days,
+            'total_customers': total_customers,
+            'new_customers': new_customers,
+            'active_customers': len(active_customer_ids),
+            'repeat_customers': repeat_customers,
+            'repeat_customer_rate': round((repeat_customers / total_customers) * 100, 1) if total_customers else 0,
+        },
+        'growth': list(growth_map.values()),
+        'top_customers': top_customers,
+        'locations': locations,
+    }
+
 def convert_usd_to_kes(amount):
     return round(float(amount or 0) * 128.5, 2)
 
@@ -3166,6 +3410,73 @@ def admin_analytics_overview():
         'status': 'success',
         'analytics': build_admin_analytics_payload(),
     })
+
+@app.route('/admin/analytics/activity', methods=['GET'])
+@admin_required()
+def admin_analytics_activity():
+    limit = parse_int(request.args.get('limit'), 20) or 20
+    limit = max(1, min(limit, 100))
+
+    return jsonify({
+        'status': 'success',
+        'activities': build_admin_activity_feed(limit=limit),
+    })
+
+@app.route('/admin/analytics/inventory', methods=['GET'])
+@admin_required()
+def admin_analytics_inventory():
+    return jsonify({
+        'status': 'success',
+        'inventory': build_inventory_analytics_payload(),
+    })
+
+@app.route('/admin/analytics/customers', methods=['GET'])
+@admin_required()
+def admin_analytics_customers():
+    days = parse_int(request.args.get('days'), 30) or 30
+
+    return jsonify({
+        'status': 'success',
+        'customers': build_customer_analytics_payload(days=days),
+    })
+
+@app.route('/analytics/track', methods=['POST'])
+@jwt_required(optional=True)
+def analytics_track():
+    data = request.get_json(silent=True) or {}
+    event_type = normalize_category_name(data.get('event_type'))
+    if not event_type:
+        return jsonify({'error': 'event_type is required'}), 400
+
+    raw_event_data = data.get('event_data')
+    if isinstance(raw_event_data, dict):
+        event_data = raw_event_data
+    elif raw_event_data is None:
+        event_data = {}
+    else:
+        event_data = {'value': raw_event_data}
+
+    user = get_current_user()
+    event = AnalyticsEvent(
+        event_type=event_type,
+        event_data=event_data,
+        user_id=user.id if user else None,
+        session_id=normalize_delivery_text(data.get('session_id')) or None,
+        ip_address=request.headers.get('X-Forwarded-For', request.remote_addr),
+        user_agent=request.headers.get('User-Agent'),
+        referrer=request.headers.get('Referer'),
+    )
+    db.session.add(event)
+    db.session.commit()
+
+    return jsonify({
+        'status': 'success',
+        'event': {
+            'id': event.id,
+            'event_type': event.event_type,
+            'created_at': serialize_datetime(event.created_at),
+        },
+    }), 201
 
 @app.route('/admin/products', methods=['GET', 'POST'])
 @admin_required()
