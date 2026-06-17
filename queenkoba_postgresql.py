@@ -13,6 +13,7 @@ import re
 from dotenv import load_dotenv
 import requests
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import joinedload
 
 load_dotenv()
 
@@ -79,7 +80,18 @@ if database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'queenkoba-super-secret-jwt-key')
+
+# Validate JWT Secret Key
+jwt_secret = os.getenv('JWT_SECRET_KEY')
+if not jwt_secret:
+    flask_env = os.getenv('FLASK_ENV', 'development').lower()
+    node_env = os.getenv('NODE_ENV', 'development').lower()
+    if flask_env == 'production' or node_env == 'production':
+        raise RuntimeError("JWT_SECRET_KEY environment variable is required in production environment!")
+    else:
+        jwt_secret = 'queenkoba-super-secret-jwt-key'
+        print("WARNING: Using insecure default JWT_SECRET_KEY. Do not use this configuration in production!")
+app.config['JWT_SECRET_KEY'] = jwt_secret
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 
 db = SQLAlchemy(app)
@@ -709,6 +721,27 @@ def admin_required():
 
             return fn(*args, **kwargs)
         return wrapper
+    return decorator
+
+from collections import defaultdict
+import time
+login_attempts = defaultdict(list)
+
+def rate_limit(limit=5, period=60):
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            ip = request.remote_addr
+            now = time.time()
+            login_attempts[ip] = [t for t in login_attempts[ip] if now - t < period]
+            if len(login_attempts[ip]) >= limit:
+                return jsonify({
+                    'message': 'Too many attempts. Please try again later.',
+                    'retry_after': int(period - (now - login_attempts[ip][0]))
+                }), 429
+            login_attempts[ip].append(now)
+            return f(*args, **kwargs)
+        return decorated_function
     return decorator
 
 def verify_google_credential(credential):
@@ -1820,7 +1853,7 @@ def build_customer_analytics_payload(days=30):
     start_at = datetime(start_at.year, start_at.month, start_at.day)
 
     customers = User.query.filter_by(role='customer').order_by(User.created_at.desc()).all()
-    orders = Order.query.order_by(Order.created_at.desc()).all()
+    orders = Order.query.options(joinedload(Order.user)).order_by(Order.created_at.desc()).all()
 
     orders_by_user = {}
     spent_by_user = {}
@@ -2127,6 +2160,16 @@ def start_mpesa_stk_push(phone_number, amount_kes, order, description='Queen Kob
     normalized_phone = normalize_mpesa_phone(phone_number)
     timestamp = get_mpesa_timestamp()
     token = get_mpesa_access_token()
+    
+    callback_url = config['callback_url']
+    callback_token = os.getenv('M_PESA_CALLBACK_TOKEN')
+    if callback_token and 'token=' not in callback_url:
+        from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+        u = urlparse(callback_url)
+        q = parse_qsl(u.query)
+        q.append(('token', callback_token))
+        callback_url = urlunparse(u._replace(query=urlencode(q)))
+
     payload = {
         'BusinessShortCode': config['shortcode'],
         'Password': build_mpesa_password(config['shortcode'], config['passkey'], timestamp),
@@ -2136,7 +2179,7 @@ def start_mpesa_stk_push(phone_number, amount_kes, order, description='Queen Kob
         'PartyA': normalized_phone,
         'PartyB': config['shortcode'],
         'PhoneNumber': normalized_phone,
-        'CallBackURL': config['callback_url'],
+        'CallBackURL': callback_url,
         'AccountReference': order.order_id or config['account_reference'],
         'TransactionDesc': description[:182],
     }
@@ -2564,6 +2607,7 @@ def get_product(product_id):
     })
 
 @app.route('/auth/signup', methods=['POST'])
+@rate_limit(limit=5, period=60)
 def signup():
     data = request.get_json() or {}
 
@@ -2612,6 +2656,7 @@ def signup():
     }), 201
 
 @app.route('/auth/register', methods=['POST'])
+@rate_limit(limit=5, period=60)
 def register():
     data = request.get_json() or {}
     username = data.get('username') or data.get('name')
@@ -2664,6 +2709,7 @@ def register():
     }), 201
 
 @app.route('/auth/login', methods=['POST'])
+@rate_limit(limit=5, period=60)
 def login():
     data = request.get_json() or {}
 
@@ -3049,6 +3095,14 @@ def checkout():
 @app.route('/payments/mpesa/callback', methods=['POST'])
 def mpesa_callback():
     log = structlog.get_logger()
+    
+    expected_token = os.getenv('M_PESA_CALLBACK_TOKEN')
+    if expected_token:
+        provided_token = request.args.get('token')
+        if provided_token != expected_token:
+            log.warning('mpesa_callback_unauthorized', error='Invalid callback token')
+            return jsonify({'ResultCode': 1, 'ResultDesc': 'Unauthorized'}), 401
+
     data = request.get_json(silent=True) or {}
     callback = (
         data.get('Body', {})
@@ -3323,6 +3377,7 @@ def get_order(order_id):
     })
 
 @app.route('/admin/auth/login', methods=['POST'])
+@rate_limit(limit=5, period=60)
 def admin_login():
     data = request.get_json() or {}
     if not data.get('email') or not data.get('password'):
@@ -3562,7 +3617,7 @@ def admin_get_orders():
     limit = parse_int(request.args.get('limit'), 100) or 100
     limit = max(1, min(limit, 500))
 
-    orders = Order.query.order_by(Order.created_at.desc()).all()
+    orders = Order.query.options(joinedload(Order.user)).order_by(Order.created_at.desc()).all()
     payloads = [build_admin_order_payload(o) for o in orders]
 
     if search:
@@ -4042,7 +4097,7 @@ def admin_promotion_detail(promo_id):
 @app.route('/admin/payments', methods=['GET'])
 @admin_required()
 def admin_get_payments():
-    orders = Order.query.order_by(Order.created_at.desc()).all()
+    orders = Order.query.options(joinedload(Order.user)).order_by(Order.created_at.desc()).all()
     payments = []
     for order in orders:
         payload = build_admin_order_payload(order)
