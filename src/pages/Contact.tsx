@@ -74,10 +74,10 @@ const Contact = () => {
                 <div>
                   <h3 className="font-display text-xl font-semibold mb-2">Call Us</h3>
                   <a
-                    href="tel:+254700000000"
+                    href="tel:+254119559180"
                     className="text-muted-foreground hover:text-primary transition-colors font-body"
                   >
-                    +254 700 000 000
+                    0119 559 180
                   </a>
                 </div>
               </div>

@@ -1,0 +1,16 @@
+{
+  "name": "royal-melanin-glow",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "npm run dev --prefix .",
+    "dev:admin": "npm run dev --prefix admin-dashboard",
+    "dev:backend": "cd backend && source venv/bin/activate && python queen-koba-backend/queenkoba_mongodb.py",
+    "dev:all": "concurrently \"npm run dev\" \"npm run dev:admin\" \"npm run dev:backend\"",
+    "build": "npm run build --prefix .",
+    "build:admin": "npm run build --prefix admin-dashboard"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  }
+}

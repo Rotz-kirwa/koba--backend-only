@@ -20,6 +20,31 @@ interface PaymentMethod {
   logo?: string;
 }
 
+const toApiCountry = (country: string) => {
+  if (country === "Congo") return "DRC Congo";
+  return country;
+};
+
+const normalizeApiPaymentMethods = (response: any): PaymentMethod[] => {
+  const rawMethods = response?.methods || response?.payment_methods || (Array.isArray(response) ? response : []);
+  if (!Array.isArray(rawMethods)) return [];
+
+  return rawMethods.map((method: any) => {
+    const id = method.id || method.code;
+    const type =
+      method.type ||
+      (id === "card" ? "card" : id === "bank" || id === "bank_transfer" ? "bank_transfer" : "mobile_money");
+
+    return {
+      id,
+      name: method.name,
+      type,
+      description: method.description || "",
+      logo: paymentLogos[id] || paymentLogos.card,
+    };
+  });
+};
+
 const paymentLogos: Record<string, string> = {
   mpesa: "https://pbs.twimg.com/ext_tw_video_thumb/1181852139011936256/pu/img/1UCUl2bSj2RCyq6H.jpg",
   airtel_money: "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcQzoFx31kmrStLhhxN53irFXTILQ93sX9hkSQ&s",
@@ -107,8 +132,8 @@ const Checkout = () => {
       
       try {
         setLoading(true);
-        const response = await paymentAPI.getByCountry(country);
-        const methods = Array.isArray(response) ? response : response?.payment_methods || [];
+        const response = await paymentAPI.getByCountry(toApiCountry(country));
+        const methods = normalizeApiPaymentMethods(response);
         if (methods.length > 0) {
           setPaymentMethods(methods);
         }
@@ -142,9 +167,20 @@ const Checkout = () => {
   const handleSubmit = async () => {
     try {
       setLoading(true);
-      
-      // Simulate payment processing
-      await new Promise(resolve => setTimeout(resolve, 2000));
+
+      const selectedMethod = paymentMethods.find((m) => m.id === paymentMethod);
+      const token = localStorage.getItem('queenkoba_token');
+      const payload = {
+        shipping_address: formData,
+        payment_method: selectedMethod?.id || paymentMethod,
+      };
+
+      if (token) {
+        await ordersAPI.create(payload);
+      } else {
+        // Keep checkout non-blocking for anonymous users during transition to full auth checkout.
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
       
       toast({
         title: "Order Placed Successfully!",

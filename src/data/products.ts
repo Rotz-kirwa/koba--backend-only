@@ -3,7 +3,7 @@ import type { Product } from "@/context/CartContext";
 export const products: Product[] = [
   {
     id: "cleanser",
-    name: "Eternal Radiance - Complexion Clarifying Cleanser",
+    name: "Complexion-Clarifying Foaming Cleanser",
     price: 1500,
     rating: 4.8,
     reviews: 87,
@@ -12,7 +12,7 @@ export const products: Product[] = [
   },
   {
     id: "toner",
-    name: "Eternal Radiance - Complexion Clarifying Toner",
+    name: "Complexion-Clarifying Toner",
     price: 1800,
     rating: 4.7,
     reviews: 64,
@@ -21,7 +21,7 @@ export const products: Product[] = [
   },
   {
     id: "serum",
-    name: "Eternal Radiance - Complexion Clarifying Serum",
+    name: "Complexion-Clarifying Serum",
     price: 2500,
     rating: 4.9,
     reviews: 112,
@@ -30,7 +30,7 @@ export const products: Product[] = [
   },
   {
     id: "cream",
-    name: "Eternal Radiance - Complexion Clarifying Cream",
+    name: "Complexion-Clarifying Cream",
     price: 2200,
     rating: 4.8,
     reviews: 95,
@@ -39,7 +39,7 @@ export const products: Product[] = [
   },
   {
     id: "mask",
-    name: "Eternal Radiance - Complexion Clarifying Mask",
+    name: "Complexion-Clarifying Wet Mask",
     price: 1200,
     rating: 4.6,
     reviews: 43,

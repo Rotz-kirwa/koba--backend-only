@@ -22,7 +22,7 @@ const apiClient = async (endpoint: string, options: RequestInit = {}) => {
     const data = await response.json();
 
     if (!response.ok) {
-      throw new Error(data.message || 'API request failed');
+      throw new Error(data.message || data.error || 'API request failed');
     }
 
     return data;

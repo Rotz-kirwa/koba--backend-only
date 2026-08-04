@@ -58,9 +58,9 @@ const Testimonials = () => {
           transition={{ duration: 0.7 }}
           className="text-center mb-16"
         >
-          <p className="text-sm tracking-[0.3em] uppercase text-primary font-body mb-4">Royal Reviews</p>
+          <p className="text-sm tracking-[0.3em] uppercase text-primary font-body mb-4">What Queens Are Saying</p>
           <h2 className="font-display text-4xl md:text-5xl lg:text-6xl font-light mb-4">
-            Loved by <span className="italic text-gold-gradient">Queens</span>
+            Real Glow <span className="italic text-gold-gradient">Stories</span>
           </h2>
           <div className="flex items-center justify-center gap-2 mt-4">
             <div className="flex">
@@ -68,7 +68,7 @@ const Testimonials = () => {
                 <Star key={i} className="w-5 h-5 text-primary fill-primary" />
               ))}
             </div>
-            <span className="font-body text-sm text-muted-foreground">4.8/5 from 1M+ Queens Worldwide</span>
+            <span className="font-body text-sm text-muted-foreground">4.8/5 from 200+ Queens</span>
           </div>
         </motion.div>
 
