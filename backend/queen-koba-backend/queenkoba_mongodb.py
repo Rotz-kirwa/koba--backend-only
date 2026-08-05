@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import bcrypt
 import uuid
 import os
+import base64
+import json
 from dotenv import load_dotenv
 from functools import wraps
 
@@ -364,6 +366,98 @@ def login():
             'user': user_response
         })
         
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+def decode_google_id_token(token_str):
+    try:
+        parts = token_str.split('.')
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        padded = payload + '=' * (-len(payload) % 4)
+        decoded_bytes = base64.urlsafe_b64decode(padded)
+        return json.loads(decoded_bytes)
+    except Exception:
+        return None
+
+@app.route('/auth/signup', methods=['POST'])
+def signup():
+    return register()
+
+@app.route('/auth/google', methods=['POST'])
+def google_auth():
+    try:
+        data = request.get_json() or {}
+        credential = data.get('credential')
+        
+        email = None
+        name = 'Google User'
+        
+        if credential:
+            payload = decode_google_id_token(credential)
+            if payload and 'email' in payload:
+                email = payload['email']
+                name = payload.get('name', email.split('@')[0])
+                
+        if not email:
+            email = data.get('email')
+            name = data.get('name', name)
+            
+        if not email:
+            return jsonify({'error': 'Email not provided in Google credential'}), 400
+
+        user = None
+        try:
+            user = mongo.db.users.find_one({'email': email})
+        except Exception:
+            user = None
+
+        if not user:
+            username = email.split('@')[0]
+            user = {
+                '_id': str(uuid.uuid4()),
+                'username': username,
+                'email': email,
+                'name': name,
+                'password_hash': bcrypt.hashpw(uuid.uuid4().hex.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'),
+                'country': 'Kenya',
+                'preferred_currency': 'KES',
+                'created_at': now_utc(),
+                'updated_at': now_utc(),
+                'role': 'customer',
+                'auth_provider': 'google',
+                'cart': [],
+                'orders': []
+            }
+            try:
+                res = mongo.db.users.insert_one(user)
+                user_id = str(res.inserted_id)
+            except Exception:
+                user_id = str(user['_id'])
+        else:
+            user_id = str(user['_id'])
+
+        access_token = create_access_token(identity=user_id)
+
+        user_response = {
+            'id': user_id,
+            '_id': user_id,
+            'username': user.get('username', email.split('@')[0]) if isinstance(user, dict) else email.split('@')[0],
+            'name': name,
+            'email': email,
+            'country': user.get('country', 'Kenya') if isinstance(user, dict) else 'Kenya',
+            'preferred_currency': user.get('preferred_currency', 'KES') if isinstance(user, dict) else 'KES',
+            'role': user.get('role', 'customer') if isinstance(user, dict) else 'customer'
+        }
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Google authentication successful',
+            'token': access_token,
+            'access_token': access_token,
+            'user': user_response
+        })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
