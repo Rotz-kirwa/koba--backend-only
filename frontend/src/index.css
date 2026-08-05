@@ -1,0 +1,148 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400&family=Outfit:wght@300;400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 20 12% 7%;
+    --foreground: 38 25% 90%;
+
+    --card: 20 14% 11%;
+    --card-foreground: 38 25% 90%;
+
+    --popover: 20 14% 11%;
+    --popover-foreground: 38 25% 90%;
+
+    --primary: 42 78% 55%;
+    --primary-foreground: 20 12% 7%;
+
+    --secondary: 20 15% 16%;
+    --secondary-foreground: 38 25% 90%;
+
+    --muted: 20 10% 18%;
+    --muted-foreground: 30 12% 55%;
+
+    --accent: 38 65% 42%;
+    --accent-foreground: 38 25% 90%;
+
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 20 12% 20%;
+    --input: 20 12% 20%;
+    --ring: 42 78% 55%;
+
+    --radius: 0.25rem;
+
+    --sidebar-background: 20 14% 9%;
+    --sidebar-foreground: 38 25% 90%;
+    --sidebar-primary: 42 78% 55%;
+    --sidebar-primary-foreground: 20 12% 7%;
+    --sidebar-accent: 20 15% 16%;
+    --sidebar-accent-foreground: 38 25% 90%;
+    --sidebar-border: 20 12% 20%;
+    --sidebar-ring: 42 78% 55%;
+
+    --gold-gradient: linear-gradient(135deg, hsl(42 78% 55%), hsl(38 65% 42%));
+    --gold-glow: 0 0 40px hsl(42 78% 55% / 0.15);
+    --hero-overlay: linear-gradient(to right, hsl(20 12% 7% / 0.85), hsl(20 12% 7% / 0.4));
+
+    --font-display: 'Cormorant Garamond', serif;
+    --font-body: 'Outfit', sans-serif;
+  }
+
+  .dark {
+    --background: 20 12% 7%;
+    --foreground: 38 25% 90%;
+    --card: 20 14% 11%;
+    --card-foreground: 38 25% 90%;
+    --popover: 20 14% 11%;
+    --popover-foreground: 38 25% 90%;
+    --primary: 42 78% 55%;
+    --primary-foreground: 20 12% 7%;
+    --secondary: 20 15% 16%;
+    --secondary-foreground: 38 25% 90%;
+    --muted: 20 10% 18%;
+    --muted-foreground: 30 12% 55%;
+    --accent: 38 65% 42%;
+    --accent-foreground: 38 25% 90%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 20 12% 20%;
+    --input: 20 12% 20%;
+    --ring: 42 78% 55%;
+    --sidebar-background: 20 14% 9%;
+    --sidebar-foreground: 38 25% 90%;
+    --sidebar-primary: 42 78% 55%;
+    --sidebar-primary-foreground: 20 12% 7%;
+    --sidebar-accent: 20 15% 16%;
+    --sidebar-accent-foreground: 38 25% 90%;
+    --sidebar-border: 20 12% 20%;
+    --sidebar-ring: 42 78% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-body);
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-display);
+  }
+}
+
+@layer utilities {
+  .text-gold-gradient {
+    background: var(--gold-gradient);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  .bg-gold-gradient {
+    background: var(--gold-gradient);
+  }
+
+  .gold-glow {
+    box-shadow: var(--gold-glow);
+  }
+
+  .hero-overlay {
+    background: var(--hero-overlay);
+  }
+
+  .line-gold {
+    @apply h-px bg-gradient-to-r from-transparent via-primary to-transparent;
+  }
+
+  .section-spacing {
+    @apply py-20 md:py-28 lg:py-36;
+  }
+
+  .luxury-card {
+    @apply bg-card border border-border rounded-sm p-8 transition-all duration-500 hover:border-primary/30 hover:gold-glow;
+  }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: hsl(20 12% 7%);
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(20 12% 20%);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(42 78% 55% / 0.5);
+}
