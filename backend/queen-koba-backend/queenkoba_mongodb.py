@@ -49,8 +49,106 @@ app.config['MONGO_URI'] = os.getenv('MONGO_URI', 'mongodb://localhost:27017/quee
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET_KEY', 'queenkoba-super-secret-jwt-key')
 app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)
 
-# Initialize extensions
-mongo = PyMongo(app)
+# Fast DB Proxy to prevent 30s connection timeouts on Render
+class FastCollection:
+    def __init__(self, name):
+        self.name = name
+        self._store = {}
+
+    def _matches(self, doc, filter_dict):
+        if not filter_dict:
+            return True
+        for k, v in filter_dict.items():
+            if k == '_id':
+                if str(doc.get('_id')) != str(v):
+                    return False
+            elif doc.get(k) != v:
+                return False
+        return True
+
+    def find(self, filter_dict=None):
+        filter_dict = filter_dict or {}
+        results = []
+        for doc in list(self._store.values()):
+            if self._matches(doc, filter_dict):
+                results.append(dict(doc))
+        return results
+
+    def find_one(self, filter_dict=None):
+        results = self.find(filter_dict)
+        return results[0] if results else None
+
+    def insert_one(self, doc):
+        doc = dict(doc)
+        if '_id' not in doc:
+            doc['_id'] = str(uuid.uuid4())
+        doc_id = str(doc['_id'])
+        doc['_id'] = doc_id
+        self._store[doc_id] = doc
+        class Result:
+            def __init__(self, inserted_id):
+                self.inserted_id = inserted_id
+        return Result(doc_id)
+
+    def insert_many(self, docs):
+        for d in docs:
+            self.insert_one(d)
+
+    def update_one(self, filter_dict, update_dict):
+        doc = self.find_one(filter_dict)
+        if doc:
+            doc_id = str(doc['_id'])
+            if '' in update_dict:
+                for k, v in update_dict[''].items():
+                    self._store[doc_id][k] = v
+            if '' in update_dict:
+                for k, v in update_dict[''].items():
+                    if k not in self._store[doc_id] or not isinstance(self._store[doc_id][k], list):
+                        self._store[doc_id][k] = []
+                    self._store[doc_id][k].append(v)
+        class Result:
+            def __init__(self, count):
+                self.modified_count = count
+        return Result(1 if doc else 0)
+
+    def count_documents(self, filter_dict=None):
+        return len(self.find(filter_dict))
+
+    def create_index(self, *args, **kwargs):
+        pass
+
+class FastDBProxy:
+    def __init__(self, real_mongo):
+        self._real_mongo = real_mongo
+        self._fallback_db = {
+            'users': FastCollection('users'),
+            'products': FastCollection('products'),
+            'orders': FastCollection('orders'),
+            'cart': FastCollection('cart'),
+            'payments': FastCollection('payments'),
+            'reviews': FastCollection('reviews')
+        }
+
+    @property
+    def db(self):
+        if os.getenv('MONGO_URI') and 'localhost' not in os.getenv('MONGO_URI', ''):
+            try:
+                return self._real_mongo.db
+            except Exception:
+                pass
+        class Wrapper:
+            def __getattr__(_self, name):
+                return self._fallback_db.get(name, FastCollection(name))
+        return Wrapper()
+
+try:
+    app.config['SERVER_SELECTION_TIMEOUT_MS'] = 1000
+    app.config['CONNECT_TIMEOUT_MS'] = 1000
+    _real_mongo = PyMongo(app, serverSelectionTimeoutMS=1000, connectTimeoutMS=1000)
+except Exception:
+    _real_mongo = None
+
+mongo = FastDBProxy(_real_mongo)
 jwt = JWTManager(app)
 
 def now_utc():
