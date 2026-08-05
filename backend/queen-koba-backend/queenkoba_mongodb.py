@@ -273,18 +273,35 @@ def register():
     try:
         data = request.get_json() or {}
         
+        # Auto-derive username if not provided
+        if not data.get('username'):
+            if data.get('name'):
+                data['username'] = data['name'].strip().lower().replace(' ', '_')
+            elif data.get('email'):
+                data['username'] = data['email'].split('@')[0]
+
         # Validation
-        required_fields = ['username', 'email', 'password']
+        required_fields = ['email', 'password']
         for field in required_fields:
             if not data.get(field):
                 return jsonify({'error': f'{field} is required'}), 400
+
+        if not data.get('username'):
+            data['username'] = 'user_' + str(uuid.uuid4())[:8]
         
         # Check if user exists
-        if mongo.db.users.find_one({'email': data['email']}):
-            return jsonify({'error': 'Email already registered'}), 400
-        
-        if mongo.db.users.find_one({'username': data['username']}):
-            return jsonify({'error': 'Username already taken'}), 400
+        try:
+            if mongo.db.users.find_one({'email': data['email']}):
+                return jsonify({'error': 'Email already registered'}), 400
+            
+            # Ensure unique username
+            base_user = data['username']
+            counter = 1
+            while mongo.db.users.find_one({'username': data['username']}):
+                data['username'] = f'{base_user}_{counter}'
+                counter += 1
+        except Exception:
+            pass
         
         # Create user
         user = {
