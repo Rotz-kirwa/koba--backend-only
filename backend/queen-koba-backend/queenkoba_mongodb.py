@@ -11,6 +11,7 @@ import base64
 import json
 from dotenv import load_dotenv
 from functools import wraps
+import requests
 
 # Load environment variables
 load_dotenv()
@@ -849,8 +850,90 @@ def remove_from_cart(product_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ========== MPESA STK PUSH HELPER ==========
+def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
+    try:
+        phone = str(phone_number).strip().replace('+', '').replace(' ', '')
+        if phone.startswith('0'):
+            phone = '254' + phone[1:]
+        elif phone.startswith('7') or phone.startswith('1'):
+            phone = '254' + phone
+            
+        env = os.getenv('MPESA_ENVIRONMENT', 'sandbox').lower()
+        consumer_key = os.getenv('MPESA_CONSUMER_KEY', 'xGq4uGZGxA1eGAuYNA4Z0p8V55O3e20e')
+        consumer_secret = os.getenv('MPESA_CONSUMER_SECRET', 'mUu8wN42A2y74w3J')
+        shortcode = os.getenv('MPESA_SHORTCODE', '174379')
+        passkey = os.getenv('MPESA_PASSKEY', 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919')
+        callback_url = os.getenv('MPESA_CALLBACK_URL', 'https://koba-backend-only-k8vt.onrender.com/payments/mpesa/callback')
+        
+        base_url = "https://api.safaricom.co.ke" if env == "production" else "https://sandbox.safaricom.co.ke"
+        
+        auth_response = requests.get(
+            f"{base_url}/oauth/v1/generate?grant_type=client_credentials",
+            auth=(consumer_key, consumer_secret),
+            timeout=10
+        )
+        auth_data = auth_response.json()
+        access_token = auth_data.get('access_token')
+        
+        if not access_token:
+            return {'success': False, 'customer_message': 'M-Pesa authorization failed', 'data': auth_data}
+            
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        data_to_encode = f"{shortcode}{passkey}{timestamp}"
+        password = base64.b64encode(data_to_encode.encode()).decode('utf-8')
+        
+        amount = max(1, int(round(float(amount_kes))))
+        
+        payload = {
+            "BusinessShortCode": shortcode,
+            "Password": password,
+            "Timestamp": timestamp,
+            "TransactionType": "CustomerPayBillOnline",
+            "Amount": amount,
+            "PartyA": phone,
+            "PartyB": shortcode,
+            "PhoneNumber": phone,
+            "CallBackURL": callback_url,
+            "AccountReference": f"QK-{order_id}",
+            "TransactionDesc": f"Payment for Queen Koba Order {order_id}"
+        }
+        
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        stk_response = requests.post(
+            f"{base_url}/mpesa/stkpush/v1/processrequest",
+            json=payload,
+            headers=headers,
+            timeout=15
+        )
+        stk_data = stk_response.json()
+        
+        checkout_request_id = stk_data.get('CheckoutRequestID')
+        response_code = stk_data.get('ResponseCode')
+        
+        if str(response_code) == "0":
+            return {
+                'success': True,
+                'checkout_request_id': checkout_request_id,
+                'customer_message': stk_data.get('CustomerMessage', 'Check your phone and enter your M-Pesa PIN to complete payment.'),
+                'data': stk_data
+            }
+        else:
+            return {
+                'success': False,
+                'customer_message': stk_data.get('CustomerMessage') or stk_data.get('errorMessage') or 'Failed to trigger M-Pesa prompt',
+                'data': stk_data
+            }
+    except Exception as err:
+        return {'success': False, 'customer_message': f'M-Pesa error: {str(err)}', 'error': str(err)}
+
 # ========== CHECKOUT & ORDERS ==========
-@app.route('/checkout', methods=['POST'])
+@app.route('/checkout', methods=['POST', 'GET'])
+@app.route('/api/checkout', methods=['POST', 'GET'])
 @jwt_required(optional=True)
 def checkout():
     try:
@@ -912,20 +995,33 @@ def checkout():
         
         # If totals were passed in KES, calculate grand total USD
         totals = data.get('totals', {})
-        if totals.get('grand_total_kes'):
-            total_usd = round(float(totals['grand_total_kes']) / 128.5, 2)
+        grand_total_kes = float(totals.get('grand_total_kes', 0))
+        if grand_total_kes > 0:
+            total_usd = round(grand_total_kes / 128.5, 2)
+        else:
+            grand_total_kes = total_usd * 128.5
             
         order_id_code = str(uuid.uuid4())[:8].upper()
-        
+        payment_method = str(data.get('payment_method', 'card')).lower()
+        payment_details = data.get('payment_details') or {}
+        phone_number = payment_details.get('phoneNumber') or data.get('shipping_address', {}).get('phone') or (user.get('phone') if user else None)
+
+        stk_result = None
+        if payment_method in ('mpesa', 'm-pesa') and phone_number:
+            stk_result = trigger_mpesa_stk_push(phone_number, grand_total_kes, order_id_code)
+            if stk_result and stk_result.get('checkout_request_id'):
+                payment_details['checkout_request_id'] = stk_result['checkout_request_id']
+
         # Create order
         order = {
             'order_id': order_id_code,
             'user_id': user_id or ('guest_' + str(uuid.uuid4())[:8]),
             'items': order_items,
             'total_usd': total_usd,
+            'total_kes': grand_total_kes,
             'shipping_address': data.get('shipping_address', {}),
-            'payment_method': data.get('payment_method', 'card'),
-            'payment_details': data.get('payment_details', {}),
+            'payment_method': payment_method,
+            'payment_details': payment_details,
             'payment_status': 'pending',
             'order_status': 'processing',
             'created_at': now_utc(),
@@ -951,14 +1047,21 @@ def checkout():
                 user_id,
                 {'$set': {'orders': user_orders}}
             )
+
+        customer_msg = (stk_result and stk_result.get('customer_message')) or 'Check your phone and enter your M-Pesa PIN to complete payment.'
             
         return jsonify({
             'status': 'success',
-            'message': 'Order created successfully',
+            'message': customer_msg,
             'order_id': order_id_code,
             'order_number': order_db_id,
             'total': total_usd,
-            'items_count': len(order_items)
+            'items_count': len(order_items),
+            'payment': {
+                'payment_status': 'pending',
+                'customer_message': customer_msg,
+                'stk_sent': bool(stk_result and stk_result.get('success'))
+            }
         })
         
     except Exception as e:
