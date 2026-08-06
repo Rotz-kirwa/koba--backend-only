@@ -31,6 +31,7 @@ def add_cors_headers(response):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, Accept, Origin'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
     response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups'
     return response
 
 @app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
@@ -45,6 +46,7 @@ def options_handler(path):
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, Accept, Origin'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
     response.headers['Access-Control-Allow-Credentials'] = 'true'
+    response.headers['Cross-Origin-Opener-Policy'] = 'same-origin-allow-popups'
     return response, 200
 
 # Configuration
@@ -700,7 +702,7 @@ def get_profile():
         user = find_one_by_id(mongo.db.users, user_id)
         
         if not user:
-            return jsonify({'error': 'User not found'}), 404
+            return jsonify({'error': 'Session expired or user not found'}), 401
         
         user_response = {
             '_id': str(user['_id']),
@@ -722,14 +724,18 @@ def get_profile():
 
 # ========== CART ROUTES ==========
 @app.route('/cart', methods=['GET'])
-@jwt_required()
+@jwt_required(optional=True)
 def get_cart():
     try:
         user_id = get_jwt_identity()
-        user = find_one_by_id(mongo.db.users, user_id)
+        user = find_one_by_id(mongo.db.users, user_id) if user_id else None
         
         if not user:
-            return jsonify({'error': 'User not found'}), 404
+            return jsonify({
+                'status': 'success',
+                'cart': [],
+                'total': {'usd': 0, 'local': 0, 'currency': 'KES', 'symbol': 'KSh'}
+            })
         
         cart_items = user.get('cart', [])
         
