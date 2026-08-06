@@ -1027,7 +1027,65 @@ def get_order(order_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ========== PAYMENT METHODS ==========
+# ========== PAYMENT METHODS & MPESA ==========
+@app.route('/payments/mpesa/status/<order_id>', methods=['GET', 'POST'])
+def get_mpesa_status(order_id):
+    try:
+        # Find order safely by _id or order_id
+        order = find_one_by_id(mongo.db.orders, order_id)
+        if not order:
+            order = mongo.db.orders.find_one({'order_id': order_id})
+            
+        if not order:
+            return jsonify({
+                'status': 'success',
+                'payment': {
+                    'payment_status': 'pending',
+                    'customer_message': 'Order created. Waiting for M-Pesa payment prompt confirmation...'
+                },
+                'message': 'Awaiting M-Pesa payment prompt...'
+            })
+            
+        payment_status = order.get('payment_status', 'pending')
+        payment_details = order.get('payment_details', {})
+        
+        customer_message = (
+            'Payment completed successfully.'
+            if payment_status in ('paid', 'completed', 'success')
+            else 'Awaiting M-Pesa payment prompt on your phone...'
+        )
+        
+        return jsonify({
+            'status': 'success',
+            'payment': {
+                'payment_status': 'paid' if payment_status in ('paid', 'completed', 'success') else payment_status,
+                'customer_message': customer_message,
+                'details': payment_details
+            },
+            'message': customer_message
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/payments/mpesa/callback', methods=['POST'])
+def mpesa_callback():
+    try:
+        data = request.get_json() or {}
+        stk_callback = data.get('Body', {}).get('stkCallback', {})
+        result_code = stk_callback.get('ResultCode')
+        checkout_request_id = stk_callback.get('CheckoutRequestID')
+        
+        if checkout_request_id:
+            status = 'paid' if result_code == 0 else 'failed'
+            mongo.db.orders.update_one(
+                {'payment_details.checkout_request_id': checkout_request_id},
+                {'$set': {'payment_status': status, 'updated_at': now_utc()}}
+            )
+            
+        return jsonify({'ResultCode': 0, 'ResultDesc': 'Accepted'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/payment-methods/<country>', methods=['GET'])
 def get_payment_methods(country):
     country_aliases = {
