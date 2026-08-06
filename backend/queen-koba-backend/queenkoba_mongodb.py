@@ -11,7 +11,8 @@ import base64
 import json
 from dotenv import load_dotenv
 from functools import wraps
-import requests
+import urllib.request
+import urllib.parse
 
 # Load environment variables
 load_dotenv()
@@ -868,21 +869,21 @@ def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
         
         base_url = "https://api.safaricom.co.ke" if env == "production" else "https://sandbox.safaricom.co.ke"
         
-        auth_response = requests.get(
-            f"{base_url}/oauth/v1/generate?grant_type=client_credentials",
-            auth=(consumer_key, consumer_secret),
-            timeout=10
-        )
-        auth_data = auth_response.json()
-        access_token = auth_data.get('access_token')
+        # 1. Fetch OAuth Access Token
+        auth_url = f"{base_url}/oauth/v1/generate?grant_type=client_credentials"
+        auth_string = base64.b64encode(f"{consumer_key}:{consumer_secret}".encode()).decode('utf-8')
+        auth_req = urllib.request.Request(auth_url, headers={"Authorization": f"Basic {auth_string}"})
         
+        with urllib.request.urlopen(auth_req, timeout=12) as auth_res:
+            auth_data = json.loads(auth_res.read().decode())
+            
+        access_token = auth_data.get('access_token')
         if not access_token:
             return {'success': False, 'customer_message': 'M-Pesa authorization failed', 'data': auth_data}
             
         timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
         data_to_encode = f"{shortcode}{passkey}{timestamp}"
         password = base64.b64encode(data_to_encode.encode()).decode('utf-8')
-        
         amount = max(1, int(round(float(amount_kes))))
         
         payload = {
@@ -899,19 +900,20 @@ def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
             "TransactionDesc": f"Payment for Queen Koba Order {order_id}"
         }
         
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-        
-        stk_response = requests.post(
+        json_payload = json.dumps(payload).encode('utf-8')
+        stk_req = urllib.request.Request(
             f"{base_url}/mpesa/stkpush/v1/processrequest",
-            json=payload,
-            headers=headers,
-            timeout=15
+            data=json_payload,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            },
+            method="POST"
         )
-        stk_data = stk_response.json()
         
+        with urllib.request.urlopen(stk_req, timeout=15) as stk_res:
+            stk_data = json.loads(stk_res.read().decode())
+            
         checkout_request_id = stk_data.get('CheckoutRequestID')
         response_code = stk_data.get('ResponseCode')
         
@@ -929,7 +931,7 @@ def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
                 'data': stk_data
             }
     except Exception as err:
-        return {'success': False, 'customer_message': f'M-Pesa error: {str(err)}', 'error': str(err)}
+        return {'success': False, 'customer_message': f'M-Pesa status: {str(err)}', 'error': str(err)}
 
 # ========== CHECKOUT & ORDERS ==========
 @app.route('/checkout', methods=['POST', 'GET'])
