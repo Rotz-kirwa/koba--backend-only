@@ -58,6 +58,12 @@ class FastCollection:
     def _matches(self, doc, filter_dict):
         if not filter_dict:
             return True
+        if '$or' in filter_dict:
+            or_list = filter_dict['$or']
+            return any(self._matches(doc, cond) for cond in or_list)
+        if '$and' in filter_dict:
+            and_list = filter_dict['$and']
+            return all(self._matches(doc, cond) for cond in and_list)
         for k, v in filter_dict.items():
             if k == '_id':
                 if str(doc.get('_id')) != str(v):
@@ -98,17 +104,32 @@ class FastCollection:
         doc = self.find_one(filter_dict)
         if doc:
             doc_id = str(doc['_id'])
-            if '' in update_dict:
-                for k, v in update_dict[''].items():
+            if '$set' in update_dict:
+                for k, v in update_dict['$set'].items():
                     self._store[doc_id][k] = v
-            if '' in update_dict:
-                for k, v in update_dict[''].items():
+            if '$push' in update_dict:
+                for k, v in update_dict['$push'].items():
                     if k not in self._store[doc_id] or not isinstance(self._store[doc_id][k], list):
                         self._store[doc_id][k] = []
                     self._store[doc_id][k].append(v)
+            if '$set' not in update_dict and '$push' not in update_dict:
+                for k, v in update_dict.items():
+                    self._store[doc_id][k] = v
         class Result:
             def __init__(self, count):
                 self.modified_count = count
+                self.matched_count = count
+        return Result(1 if doc else 0)
+
+    def delete_one(self, filter_dict):
+        doc = self.find_one(filter_dict)
+        if doc:
+            doc_id = str(doc['_id'])
+            if doc_id in self._store:
+                del self._store[doc_id]
+        class Result:
+            def __init__(self, count):
+                self.deleted_count = count
         return Result(1 if doc else 0)
 
     def count_documents(self, filter_dict=None):
@@ -155,6 +176,73 @@ def now_utc():
     return datetime.utcnow()
 
 # ========== HELPER FUNCTIONS ==========
+def safe_id_filter(id_val):
+    """
+    Creates a query filter for matching '_id'.
+    Handles both ObjectId (24 hex chars) and UUID/string IDs gracefully without throwing InvalidId.
+    """
+    if not id_val:
+        return {'_id': None}
+    
+    if isinstance(id_val, ObjectId):
+        return {'$or': [{'_id': id_val}, {'_id': str(id_val)}]}
+        
+    id_str = str(id_val).strip()
+    if ObjectId.is_valid(id_str):
+        try:
+            return {'$or': [{'_id': ObjectId(id_str)}, {'_id': id_str}]}
+        except Exception:
+            pass
+            
+    return {'_id': id_str}
+
+def find_one_by_id(collection, id_val, extra_filter=None):
+    """Safely query document by _id regardless of ObjectId or UUID string format."""
+    if not id_val:
+        return None
+    base_filter = safe_id_filter(id_val)
+    if extra_filter:
+        if '$or' in base_filter:
+            filter_query = {'$and': [base_filter, extra_filter]}
+        else:
+            filter_query = {**base_filter, **extra_filter}
+    else:
+        filter_query = base_filter
+        
+    try:
+        return collection.find_one(filter_query)
+    except Exception:
+        try:
+            id_str = str(id_val).strip()
+            direct_filter = {'_id': id_str}
+            if extra_filter:
+                direct_filter.update(extra_filter)
+            return collection.find_one(direct_filter)
+        except Exception:
+            return None
+
+def update_one_by_id(collection, id_val, update_dict):
+    """Safely update document by _id regardless of ObjectId or UUID string format."""
+    if not id_val:
+        return None
+    base_filter = safe_id_filter(id_val)
+    try:
+        return collection.update_one(base_filter, update_dict)
+    except Exception:
+        id_str = str(id_val).strip()
+        return collection.update_one({'_id': id_str}, update_dict)
+
+def delete_one_by_id(collection, id_val):
+    """Safely delete document by _id regardless of ObjectId or UUID string format."""
+    if not id_val:
+        return None
+    base_filter = safe_id_filter(id_val)
+    try:
+        return collection.delete_one(base_filter)
+    except Exception:
+        id_str = str(id_val).strip()
+        return collection.delete_one({'_id': id_str})
+
 def serialize_doc(doc):
     """Convert MongoDB document to JSON serializable format"""
     if not doc:
@@ -166,10 +254,9 @@ def serialize_doc(doc):
 def get_current_user():
     """Resolve current user from JWT identity."""
     user_id = get_jwt_identity()
-    try:
-        return mongo.db.users.find_one({'_id': ObjectId(user_id)})
-    except Exception:
+    if not user_id:
         return None
+    return find_one_by_id(mongo.db.users, user_id)
 
 def admin_required(fn):
     """Decorator that requires JWT and admin role."""
@@ -380,7 +467,7 @@ def get_products():
 @app.route('/products/<product_id>', methods=['GET'])
 def get_product(product_id):
     try:
-        product = mongo.db.products.find_one({'_id': ObjectId(product_id)})
+        product = find_one_by_id(mongo.db.products, product_id)
         if not product:
             return jsonify({'error': 'Product not found'}), 404
         
@@ -388,8 +475,8 @@ def get_product(product_id):
             'status': 'success',
             'product': serialize_doc(product)
         })
-    except:
-        return jsonify({'error': 'Invalid product ID'}), 400
+    except Exception as e:
+        return jsonify({'error': str(e)}), 400
 
 # ========== AUTH ROUTES ==========
 @app.route('/auth/register', methods=['POST'])
@@ -607,19 +694,19 @@ def google_auth():
 def get_profile():
     try:
         user_id = get_jwt_identity()
-        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        user = find_one_by_id(mongo.db.users, user_id)
         
         if not user:
             return jsonify({'error': 'User not found'}), 404
         
         user_response = {
             '_id': str(user['_id']),
-            'username': user['username'],
-            'email': user['email'],
-            'country': user['country'],
-            'preferred_currency': user['preferred_currency'],
-            'role': user['role'],
-            'created_at': user['created_at'].isoformat() if 'created_at' in user else None
+            'username': user.get('username', ''),
+            'email': user.get('email', ''),
+            'country': user.get('country', 'Kenya'),
+            'preferred_currency': user.get('preferred_currency', 'KES'),
+            'role': user.get('role', 'customer'),
+            'created_at': user['created_at'].isoformat() if isinstance(user.get('created_at'), datetime) else user.get('created_at')
         }
         
         return jsonify({
@@ -636,7 +723,7 @@ def get_profile():
 def get_cart():
     try:
         user_id = get_jwt_identity()
-        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        user = find_one_by_id(mongo.db.users, user_id)
         
         if not user:
             return jsonify({'error': 'User not found'}), 404
@@ -646,7 +733,7 @@ def get_cart():
         # Calculate totals
         total_usd = 0
         for item in cart_items:
-            product = mongo.db.products.find_one({'_id': ObjectId(item['product_id'])})
+            product = find_one_by_id(mongo.db.products, item['product_id'])
             if product:
                 item['product_name'] = product['name']
                 item['product_price'] = product['base_price_usd']
@@ -682,19 +769,19 @@ def get_cart():
 def add_to_cart():
     try:
         user_id = get_jwt_identity()
-        data = request.get_json()
+        data = request.get_json() or {}
         
         # Validation
         if not data.get('product_id') or not data.get('quantity'):
             return jsonify({'error': 'Product ID and quantity required'}), 400
         
         # Check if product exists
-        product = mongo.db.products.find_one({'_id': ObjectId(data['product_id'])})
-        if not product:
-            return jsonify({'error': 'Product not found'}), 404
-        
+        product = find_one_by_id(mongo.db.products, data['product_id'])
+        if not product and data.get('product_name'):
+            product = mongo.db.products.find_one({'name': data['product_name']})
+            
         # Get user
-        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        user = find_one_by_id(mongo.db.users, user_id)
         if not user:
             return jsonify({'error': 'User not found'}), 404
         
@@ -716,8 +803,9 @@ def add_to_cart():
             })
         
         # Update user's cart
-        mongo.db.users.update_one(
-            {'_id': ObjectId(user_id)},
+        update_one_by_id(
+            mongo.db.users,
+            user_id,
             {'$set': {'cart': cart, 'updated_at': now_utc()}}
         )
         
@@ -737,7 +825,7 @@ def remove_from_cart(product_id):
         user_id = get_jwt_identity()
         
         # Get user
-        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
+        user = find_one_by_id(mongo.db.users, user_id)
         if not user:
             return jsonify({'error': 'User not found'}), 404
         
@@ -746,8 +834,9 @@ def remove_from_cart(product_id):
         new_cart = [item for item in cart if item['product_id'] != product_id]
         
         # Update user's cart
-        mongo.db.users.update_one(
-            {'_id': ObjectId(user_id)},
+        update_one_by_id(
+            mongo.db.users,
+            user_id,
             {'$set': {'cart': new_cart, 'updated_at': now_utc()}}
         )
         
@@ -762,19 +851,21 @@ def remove_from_cart(product_id):
 
 # ========== CHECKOUT & ORDERS ==========
 @app.route('/checkout', methods=['POST'])
-@jwt_required()
+@jwt_required(optional=True)
 def checkout():
     try:
         user_id = get_jwt_identity()
         data = request.get_json() or {}
         
-        # Get user
-        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
-        if not user:
-            return jsonify({'error': 'User not found'}), 404
+        # Get user if logged in
+        user = find_one_by_id(mongo.db.users, user_id) if user_id else None
         
-        cart = user.get('cart', [])
-        if len(cart) == 0:
+        # Get items from request body or user cart
+        cart = data.get('items')
+        if not cart and user:
+            cart = user.get('cart', [])
+            
+        if not cart or len(cart) == 0:
             return jsonify({'error': 'Cart is empty'}), 400
         
         # Calculate total
@@ -782,27 +873,59 @@ def checkout():
         order_items = []
         
         for item in cart:
-            product = mongo.db.products.find_one({'_id': ObjectId(item['product_id'])})
+            prod_id = item.get('product_id') or item.get('id')
+            product = find_one_by_id(mongo.db.products, prod_id) if prod_id else None
+            
+            if not product and item.get('product_name'):
+                product = mongo.db.products.find_one({'name': item.get('product_name')})
+                
             if product:
-                item_total = product['base_price_usd'] * item['quantity']
+                base_price = product.get('base_price_usd', 0)
+                if base_price == 0 and item.get('price_per_item_kes'):
+                    base_price = round(float(item['price_per_item_kes']) / 128.5, 2)
+                item_qty = int(item.get('quantity', 1))
+                item_total = base_price * item_qty
                 total_usd += item_total
                 
                 order_items.append({
                     'product_id': str(product['_id']),
-                    'product_name': product['name'],
-                    'quantity': item['quantity'],
-                    'price_per_item': product['base_price_usd'],
+                    'product_name': product.get('name', item.get('product_name', 'Skincare Product')),
+                    'quantity': item_qty,
+                    'price_per_item': base_price,
+                    'item_total': item_total
+                })
+            else:
+                # Fallback for catalog products not yet stored in DB
+                kes_price = float(item.get('price_per_item_kes') or item.get('price') or 0)
+                base_price = round(kes_price / 128.5, 2) if kes_price > 0 else float(item.get('price_per_item', 25.0))
+                item_qty = int(item.get('quantity', 1))
+                item_total = base_price * item_qty
+                total_usd += item_total
+                
+                order_items.append({
+                    'product_id': str(prod_id or uuid.uuid4()),
+                    'product_name': item.get('product_name', 'Skincare Product'),
+                    'quantity': item_qty,
+                    'price_per_item': base_price,
                     'item_total': item_total
                 })
         
+        # If totals were passed in KES, calculate grand total USD
+        totals = data.get('totals', {})
+        if totals.get('grand_total_kes'):
+            total_usd = round(float(totals['grand_total_kes']) / 128.5, 2)
+            
+        order_id_code = str(uuid.uuid4())[:8].upper()
+        
         # Create order
         order = {
-            'order_id': str(uuid.uuid4())[:8].upper(),
-            'user_id': user_id,
+            'order_id': order_id_code,
+            'user_id': user_id or ('guest_' + str(uuid.uuid4())[:8]),
             'items': order_items,
             'total_usd': total_usd,
             'shipping_address': data.get('shipping_address', {}),
             'payment_method': data.get('payment_method', 'card'),
+            'payment_details': data.get('payment_details', {}),
             'payment_status': 'pending',
             'order_status': 'processing',
             'created_at': now_utc(),
@@ -811,27 +934,29 @@ def checkout():
         
         # Save order
         order_result = mongo.db.orders.insert_one(order)
-        order_id = str(order_result.inserted_id)
+        order_db_id = str(order_result.inserted_id)
         
-        # Clear user's cart
-        mongo.db.users.update_one(
-            {'_id': ObjectId(user_id)},
-            {'$set': {'cart': [], 'updated_at': now_utc()}}
-        )
-        
-        # Add order to user's orders
-        user_orders = user.get('orders', [])
-        user_orders.append(order_id)
-        mongo.db.users.update_one(
-            {'_id': ObjectId(user_id)},
-            {'$set': {'orders': user_orders}}
-        )
-        
+        # Clear user's cart if user exists
+        if user_id:
+            update_one_by_id(
+                mongo.db.users,
+                user_id,
+                {'$set': {'cart': [], 'updated_at': now_utc()}}
+            )
+            
+            user_orders = user.get('orders', []) if user else []
+            user_orders.append(order_db_id)
+            update_one_by_id(
+                mongo.db.users,
+                user_id,
+                {'$set': {'orders': user_orders}}
+            )
+            
         return jsonify({
             'status': 'success',
             'message': 'Order created successfully',
-            'order_id': order['order_id'],
-            'order_number': order_id,
+            'order_id': order_id_code,
+            'order_number': order_db_id,
             'total': total_usd,
             'items_count': len(order_items)
         })
@@ -846,12 +971,11 @@ def get_orders():
         user_id = get_jwt_identity()
         
         # Get user's orders
-        orders = list(mongo.db.orders.find({'user_id': user_id}).sort('created_at', -1))
+        orders = list(mongo.db.orders.find({'user_id': user_id}))
         
         serialized_orders = []
         for order in orders:
             order_dict = serialize_doc(order)
-            # Convert datetime to string
             if 'created_at' in order_dict and isinstance(order_dict['created_at'], datetime):
                 order_dict['created_at'] = order_dict['created_at'].isoformat()
             serialized_orders.append(order_dict)
@@ -871,20 +995,18 @@ def get_order(order_id):
     try:
         user_id = get_jwt_identity()
         
-        # Get order
-        order = mongo.db.orders.find_one({
-            '_id': ObjectId(order_id),
-            'user_id': user_id
-        })
-        
+        # Get order safely by _id or order_id
+        order = find_one_by_id(mongo.db.orders, order_id, extra_filter={'user_id': user_id})
+        if not order:
+            order = mongo.db.orders.find_one({'order_id': order_id, 'user_id': user_id})
+            
         if not order:
             return jsonify({'error': 'Order not found'}), 404
         
         order_dict = serialize_doc(order)
         
-        # Calculate local currency total
-        user = mongo.db.users.find_one({'_id': ObjectId(user_id)})
-        preferred_currency = user.get('preferred_currency', 'KES')
+        user = find_one_by_id(mongo.db.users, user_id)
+        preferred_currency = user.get('preferred_currency', 'KES') if user else 'KES'
         exchange_rates = {'KES': 128.5, 'UGX': 3582.34, 'BIF': 2850.0, 'CDF': 2700.0}
         rate = exchange_rates.get(preferred_currency, 1)
         
@@ -997,16 +1119,18 @@ def admin_update_order_status(order_id):
     if status not in allowed_statuses:
         return jsonify({'error': 'Invalid status'}), 400
 
-    try:
-        object_id = ObjectId(order_id)
-    except Exception:
-        return jsonify({'error': 'Invalid order id'}), 400
-
-    result = mongo.db.orders.update_one(
-        {'_id': object_id},
+    result = update_one_by_id(
+        mongo.db.orders,
+        order_id,
         {'$set': {'order_status': status, 'updated_at': now_utc()}}
     )
-    if result.matched_count == 0:
+    if not result or getattr(result, 'matched_count', 0) == 0:
+        result = mongo.db.orders.update_one(
+            {'order_id': order_id},
+            {'$set': {'order_status': status, 'updated_at': now_utc()}}
+        )
+
+    if not result or getattr(result, 'matched_count', 0) == 0:
         return jsonify({'error': 'Order not found'}), 404
 
     return jsonify({'status': 'success'})
@@ -1017,19 +1141,19 @@ def admin_users():
     users = list(mongo.db.users.find(
         {'role': {'$ne': 'admin'}},
         {'password_hash': 0}
-    ).sort('created_at', -1))
+    ))
     for user in users:
         user['_id'] = str(user['_id'])
-        if user.get('created_at'):
+        if user.get('created_at') and isinstance(user['created_at'], datetime):
             user['created_at'] = user['created_at'].isoformat()
-        if user.get('updated_at'):
+        if user.get('updated_at') and isinstance(user['updated_at'], datetime):
             user['updated_at'] = user['updated_at'].isoformat()
     return jsonify(users)
 
 @app.route('/admin/payments', methods=['GET'])
 @admin_required
 def admin_payments():
-    orders = list(mongo.db.orders.find({}).sort('created_at', -1))
+    orders = list(mongo.db.orders.find({}))
     payments = []
     for order in orders:
         payments.append({
@@ -1038,7 +1162,7 @@ def admin_payments():
             'payment_method': order.get('payment_method', 'unknown'),
             'amount': round(float(order.get('total_usd', 0)) * 128.5),
             'status': order.get('payment_status', 'pending'),
-            'created_at': order.get('created_at').isoformat() if order.get('created_at') else None
+            'created_at': order.get('created_at').isoformat() if isinstance(order.get('created_at'), datetime) else order.get('created_at')
         })
     return jsonify(payments)
 
@@ -1097,13 +1221,8 @@ def admin_update_product(product_id):
 
     update_fields['updated_at'] = now_utc()
 
-    try:
-        object_id = ObjectId(product_id)
-    except Exception:
-        return jsonify({'error': 'Invalid product id'}), 400
-
-    result = mongo.db.products.update_one({'_id': object_id}, {'$set': update_fields})
-    if result.matched_count == 0:
+    result = update_one_by_id(mongo.db.products, product_id, {'$set': update_fields})
+    if not result or getattr(result, 'matched_count', 0) == 0:
         return jsonify({'error': 'Product not found'}), 404
 
     return jsonify({'status': 'success'})
@@ -1111,13 +1230,8 @@ def admin_update_product(product_id):
 @app.route('/admin/products/<product_id>', methods=['DELETE'])
 @admin_required
 def admin_delete_product(product_id):
-    try:
-        object_id = ObjectId(product_id)
-    except Exception:
-        return jsonify({'error': 'Invalid product id'}), 400
-
-    result = mongo.db.products.delete_one({'_id': object_id})
-    if result.deleted_count == 0:
+    result = delete_one_by_id(mongo.db.products, product_id)
+    if not result or getattr(result, 'deleted_count', 0) == 0:
         return jsonify({'error': 'Product not found'}), 404
 
     return jsonify({'status': 'success'})
