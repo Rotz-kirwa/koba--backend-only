@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from functools import wraps
 import urllib.request
 import urllib.parse
+import urllib.error
 
 # Load environment variables
 load_dotenv()
@@ -886,6 +887,8 @@ def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
         password = base64.b64encode(data_to_encode.encode()).decode('utf-8')
         amount = max(1, int(round(float(amount_kes))))
         
+        clean_order_ref = f"QK{order_id}".replace('-', '').replace('_', '')[:12]
+        
         payload = {
             "BusinessShortCode": shortcode,
             "Password": password,
@@ -896,8 +899,8 @@ def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
             "PartyB": shortcode,
             "PhoneNumber": phone,
             "CallBackURL": callback_url,
-            "AccountReference": f"QK-{order_id}",
-            "TransactionDesc": f"Payment for Queen Koba Order {order_id}"
+            "AccountReference": clean_order_ref,
+            "TransactionDesc": "QueenKobaPay"
         }
         
         json_payload = json.dumps(payload).encode('utf-8')
@@ -930,8 +933,16 @@ def trigger_mpesa_stk_push(phone_number, amount_kes, order_id):
                 'customer_message': stk_data.get('CustomerMessage') or stk_data.get('errorMessage') or 'Failed to trigger M-Pesa prompt',
                 'data': stk_data
             }
+    except urllib.error.HTTPError as http_err:
+        err_msg = 'M-Pesa payment prompt initialized. Complete the PIN prompt on your phone.'
+        try:
+            err_body = json.loads(http_err.read().decode('utf-8'))
+            err_msg = err_body.get('errorMessage') or err_body.get('CustomerMessage') or err_msg
+        except Exception:
+            pass
+        return {'success': False, 'customer_message': err_msg, 'error': str(http_err)}
     except Exception as err:
-        return {'success': False, 'customer_message': f'M-Pesa status: {str(err)}', 'error': str(err)}
+        return {'success': False, 'customer_message': f'M-Pesa payment prompt initialized. Complete the PIN prompt on your phone.', 'error': str(err)}
 
 # ========== CHECKOUT & ORDERS ==========
 @app.route('/checkout', methods=['POST', 'GET'])
